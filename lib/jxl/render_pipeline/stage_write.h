@@ -30,10 +30,14 @@ std::unique_ptr<RenderPipelineStage> GetWriteToImage3FStage(
     JxlMemoryManager* memory_manager, Image3F* image);
 
 // Gets a stage to write to a pixel callback or image buffer.
+// Writes the pixels of `region` of the width x height image, given before
+// undoing `undo_orientation`, to the output, oriented and relative to the
+// region.
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
-    const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
-    bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
-    std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager);
+    const ImageOutput& main_output, size_t width, size_t height,
+    const Rect& region, bool has_alpha, bool unpremul_alpha, size_t alpha_c,
+    Orientation undo_orientation, std::vector<ImageOutput>& extra_output,
+    JxlMemoryManager* memory_manager);
 
 }  // namespace jxl
 

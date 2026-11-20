@@ -288,22 +288,24 @@ VFromD<Rebind<T, DF>> MakeUnsigned(VFromD<DF> v, size_t x0, size_t y0,
 class WriteToOutputStage : public RenderPipelineStage {
  public:
   WriteToOutputStage(const ImageOutput& main_output, size_t width,
-                     size_t height, bool has_alpha, bool unpremul_alpha,
-                     size_t alpha_c, Orientation undo_orientation,
+                     size_t height, const Rect& region, bool has_alpha,
+                     bool unpremul_alpha, size_t alpha_c,
+                     Orientation undo_orientation,
                      const std::vector<ImageOutput>& extra_output,
                      JxlMemoryManager* memory_manager)
       : RenderPipelineStage(RenderPipelineStage::Settings()),
-        width_(width),
-        height_(height),
+        region_(region),
         main_(main_output),
         num_color_(main_.num_channels_ < 3 ? 1 : 3),
         want_alpha_(main_.num_channels_ == 2 || main_.num_channels_ == 4),
         has_alpha_(has_alpha),
         unpremul_alpha_(unpremul_alpha),
         alpha_c_(alpha_c),
-        flip_x_(ShouldFlipX(undo_orientation)),
-        flip_y_(ShouldFlipY(undo_orientation)),
-        transpose_(ShouldTranspose(undo_orientation)),
+        flip_x_(UndoOrientationFlipsX(undo_orientation)),
+        flip_y_(UndoOrientationFlipsY(undo_orientation)),
+        transpose_(UndoOrientationTransposes(undo_orientation)),
+        dither_x0_(flip_x_ ? width - region.x1() : region.x0()),
+        dither_y0_(flip_y_ ? height - region.y1() : region.y0()),
         opaque_alpha_(kChunkSize, 1.0f),
         memory_manager_(memory_manager) {
     for (size_t ec = 0; ec < extra_output.size(); ++ec) {
@@ -336,22 +338,30 @@ class WriteToOutputStage : public RenderPipelineStage {
                     size_t xpos, size_t ypos, size_t thread_id) const final {
     JXL_ENSURE(xextra_left == 0 && xextra_right == 0);
     JXL_ENSURE(main_.run_opaque_ || main_.buffer_);
-    if (ypos >= height_) return true;
-    if (xpos >= width_) return true;
+    // Only the part of the row in the region is written, at its position
+    // relative to the region.
+    if (ypos < region_.y0() || ypos >= region_.y1()) return true;
+    size_t x_begin = std::max(xpos, region_.x0());
+    size_t x_end = std::min(xpos + xsize, region_.x1());
+    if (x_begin >= x_end) return true;
+    size_t skip = x_begin - xpos;
+    xpos = x_begin - region_.x0();
+    ypos -= region_.y0();
     if (flip_y_) {
-      ypos = height_ - 1u - ypos;
+      ypos = region_.ysize() - 1u - ypos;
     }
-    size_t limit = std::min(xsize, width_ - xpos);
+    size_t limit = x_end - x_begin;
     for (size_t x0 = 0; x0 < limit; x0 += kChunkSize) {
       size_t xstart = xpos + x0;
       size_t len = std::min<size_t>(kChunkSize, limit - x0);
 
       const float* line_buffers[4];
       for (size_t c = 0; c < num_color_; c++) {
-        line_buffers[c] = GetInputRow(input_rows, c, 0) + x0;
+        line_buffers[c] = GetInputRow(input_rows, c, 0) + skip + x0;
       }
       if (has_alpha_) {
-        line_buffers[num_color_] = GetInputRow(input_rows, alpha_c_, 0) + x0;
+        line_buffers[num_color_] =
+            GetInputRow(input_rows, alpha_c_, 0) + skip + x0;
       } else {
         // opaque_alpha_ is a way to set all values to 1.0f.
         line_buffers[num_color_] = opaque_alpha_.data();
@@ -361,7 +371,8 @@ class WriteToOutputStage : public RenderPipelineStage {
       }
       OutputBuffers(main_, thread_id, ypos, xstart, len, line_buffers);
       for (const auto& extra : extra_channels_) {
-        line_buffers[0] = GetInputRow(input_rows, extra.channel_index_, 0) + x0;
+        line_buffers[0] =
+            GetInputRow(input_rows, extra.channel_index_, 0) + skip + x0;
         OutputBuffers(extra, thread_id, ypos, xstart, len, line_buffers);
       }
     }
@@ -438,25 +449,6 @@ class WriteToOutputStage : public RenderPipelineStage {
     }
     return true;
   }
-  static bool ShouldFlipX(Orientation undo_orientation) {
-    return (undo_orientation == Orientation::kFlipHorizontal ||
-            undo_orientation == Orientation::kRotate180 ||
-            undo_orientation == Orientation::kRotate270 ||
-            undo_orientation == Orientation::kAntiTranspose);
-  }
-  static bool ShouldFlipY(Orientation undo_orientation) {
-    return (undo_orientation == Orientation::kFlipVertical ||
-            undo_orientation == Orientation::kRotate180 ||
-            undo_orientation == Orientation::kRotate90 ||
-            undo_orientation == Orientation::kAntiTranspose);
-  }
-  static bool ShouldTranspose(Orientation undo_orientation) {
-    return (undo_orientation == Orientation::kTranspose ||
-            undo_orientation == Orientation::kRotate90 ||
-            undo_orientation == Orientation::kRotate270 ||
-            undo_orientation == Orientation::kAntiTranspose);
-  }
-
   void UnpremulAlpha(size_t thread_id, size_t len,
                      const float** line_buffers) const {
     const HWY_FULL(float) d;
@@ -488,13 +480,15 @@ class WriteToOutputStage : public RenderPipelineStage {
     }
     if (out.data_type_ == JXL_TYPE_UINT8) {
       uint8_t* JXL_RESTRICT temp = temp_out_[thread_id].address<uint8_t>();
-      StoreUnsignedRow(out, input, len, temp, xstart, ypos);
+      StoreUnsignedRow(out, input, len, temp, dither_x0_ + xstart,
+                       dither_y0_ + ypos);
       WriteToOutput(out, thread_id, ypos, xstart, len, temp);
     } else if (out.data_type_ == JXL_TYPE_UINT16 ||
                out.data_type_ == JXL_TYPE_FLOAT16) {
       uint16_t* JXL_RESTRICT temp = temp_out_[thread_id].address<uint16_t>();
       if (out.data_type_ == JXL_TYPE_UINT16) {
-        StoreUnsignedRow(out, input, len, temp, xstart, ypos);
+        StoreUnsignedRow(out, input, len, temp, dither_x0_ + xstart,
+                         dither_y0_ + ypos);
       } else {
         StoreFloat16Row(out, input, len, temp);
       }
@@ -541,7 +535,7 @@ class WriteToOutputStage : public RenderPipelineStage {
     for (size_t c = 0; c < out.num_channels_; ++c) {
       line_buffers[c] = temp_in[c];
     }
-    *xstart = width_ - *xstart - len;
+    *xstart = region_.xsize() - *xstart - len;
   }
 
   template <typename T>
@@ -693,8 +687,9 @@ class WriteToOutputStage : public RenderPipelineStage {
   }
 
   // Process row in chunks to keep per-thread buffers compact.
-  size_t width_;
-  size_t height_;
+  // Rectangle of the image, before undoing the orientation, that is written to
+  // the output; rows are written relative to it.
+  Rect region_;
   Output main_;  // color + alpha
   size_t num_color_;
   bool want_alpha_;
@@ -704,6 +699,10 @@ class WriteToOutputStage : public RenderPipelineStage {
   bool flip_x_;
   bool flip_y_;
   bool transpose_;
+  // Position of the region in the flipped image, before transposing it, for
+  // dithering as when writing the whole image.
+  size_t dither_x0_;
+  size_t dither_y0_;
   std::vector<Output> extra_channels_;
   std::vector<float> opaque_alpha_;
   JxlMemoryManager* memory_manager_;
@@ -712,11 +711,12 @@ class WriteToOutputStage : public RenderPipelineStage {
 };
 
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
-    const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
-    bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
-    std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager) {
+    const ImageOutput& main_output, size_t width, size_t height,
+    const Rect& region, bool has_alpha, bool unpremul_alpha, size_t alpha_c,
+    Orientation undo_orientation, std::vector<ImageOutput>& extra_output,
+    JxlMemoryManager* memory_manager) {
   return jxl::make_unique<WriteToOutputStage>(
-      main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
+      main_output, width, height, region, has_alpha, unpremul_alpha, alpha_c,
       undo_orientation, extra_output, memory_manager);
 }
 
@@ -849,11 +849,12 @@ std::unique_ptr<RenderPipelineStage> GetWriteToImage3FStage(
 }
 
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
-    const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
-    bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
-    std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager) {
+    const ImageOutput& main_output, size_t width, size_t height,
+    const Rect& region, bool has_alpha, bool unpremul_alpha, size_t alpha_c,
+    Orientation undo_orientation, std::vector<ImageOutput>& extra_output,
+    JxlMemoryManager* memory_manager) {
   return HWY_DYNAMIC_DISPATCH(GetWriteToOutputStage)(
-      main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
+      main_output, width, height, region, has_alpha, unpremul_alpha, alpha_c,
       undo_orientation, extra_output, memory_manager);
 }
 

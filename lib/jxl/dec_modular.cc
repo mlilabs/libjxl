@@ -318,7 +318,7 @@ Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
 }
 
 void ModularFrameDecoder::MaybeDropFullImage() {
-  if (full_image.transform.empty() && !have_something && all_same_shift) {
+  if (!WillUseFullImage()) {
     use_full_image = false;
     JXL_DEBUG_V(6, "Dropping full image");
     for (auto& ch : full_image.channel) {

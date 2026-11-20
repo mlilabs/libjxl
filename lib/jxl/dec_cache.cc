@@ -358,8 +358,8 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
 
     if (main_output.callback.IsPresent() || main_output.buffer) {
       JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToOutputStage(
-          main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
-          undo_orientation, extra_output, memory_manager)));
+          main_output, width, height, output_region, has_alpha, unpremul_alpha,
+          alpha_c, undo_orientation, extra_output, memory_manager)));
     } else {
       JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImageBundleStage(
           decoded, &output_encoding_info.color_encoding)));

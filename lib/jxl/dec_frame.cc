@@ -27,6 +27,7 @@
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/blending.h"
 #include "lib/jxl/chroma_from_luma.h"
 #include "lib/jxl/coeff_order.h"
 #include "lib/jxl/coeff_order_fwd.h"
@@ -60,6 +61,21 @@
 namespace jxl {
 
 namespace {
+
+// Upper bound of the group border of the render pipeline (see
+// LowMemoryRenderPipeline::Init), by which the DC groups needed for an output
+// region are chosen before the pipeline is prepared.
+constexpr size_t kMaxRegionGroupBorder = 4 * kBlockDim;
+
+// The range [begin, end) of the cells of `cell` pixels, of `num` in a row, that
+// intersect the pixels [x0, x1) enlarged by `border` on either side.
+std::pair<size_t, size_t> CellRange(size_t x0, size_t x1, size_t border,
+                                    size_t cell, size_t num) {
+  size_t begin = (x0 > border ? x0 - border : 0) / cell;
+  size_t end = std::min(num, DivCeil(x1 + border, cell));
+  return {begin, end};
+}
+
 Status DecodeGlobalDCInfo(BitReader* reader, bool is_jpeg,
                           PassesDecoderState* state, ThreadPool* pool) {
   JXL_RETURN_IF_ERROR(state->shared_storage.quantizer.Decode(reader));
@@ -262,7 +278,107 @@ Status FrameDecoder::InitFrameOutput() {
   decoded_passes_per_ac_group_.resize(frame_dim_.num_groups, 0);
   processed_section_.clear();
   processed_section_.resize(toc_.size());
+  region_groups_selected_ = false;
+  dc_group_needed_.clear();
+  ac_group_needed_.clear();
   allocated_ = false;
+  return true;
+}
+
+bool FrameDecoder::CanSkipOutsideRegion() const {
+  const Rect& region = dec_state_->output_region;
+  // Without image output (e.g. for frames that are only referenced, or when
+  // reconstructing a JPEG) or with the whole image, every group is needed.
+  if (!dec_state_->main_output.callback.IsPresent() &&
+      dec_state_->main_output.buffer == nullptr) {
+    return false;
+  }
+  if (region.xsize() == 0 || (region.xsize() >= frame_dim_.xsize &&
+                              region.ysize() >= frame_dim_.ysize)) {
+    return false;
+  }
+  if (frame_dim_.num_groups == 1) return false;
+  // The simple pipeline renders the frame once all groups are decoded.
+  if (use_slow_rendering_pipeline_) return false;
+  if (decoded_->IsJPEG()) return false;
+  // The frame is drawn onto the image as it is, and only to the output.
+  if (frame_header_.frame_type != FrameType::kRegularFrame) return false;
+  if (frame_header_.CanBeReferenced()) return false;
+  if (NeedsBlending(frame_header_)) return false;
+  // Pixels of the frame are pixels of the image.
+  if (frame_header_.upsampling != 1) return false;
+  for (size_t ecups : frame_header_.extra_channel_upsampling) {
+    if (ecups != 1) return false;
+  }
+  if (!frame_header_.chroma_subsampling.Is444()) return false;
+  // Groups are rendered as they are decoded.
+  if (modular_frame_decoder_.WillUseFullImage()) return false;
+  return true;
+}
+
+Status FrameDecoder::SelectDCGroupsForRegion() {
+  JXL_ENSURE(decoded_dc_global_ && !region_groups_selected_);
+  region_groups_selected_ = true;
+  if (!CanSkipOutsideRegion()) return true;
+  const Rect& region = dec_state_->output_region;
+  // The pixels of all AC groups that may be needed, and the DC groups of these
+  // with the neighbouring blocks for adaptive DC smoothing.
+  const size_t group_dim = frame_dim_.group_dim;
+  auto gx = CellRange(region.x0(), region.x1(), kMaxRegionGroupBorder,
+                      group_dim, frame_dim_.xsize_groups);
+  auto gy = CellRange(region.y0(), region.y1(), kMaxRegionGroupBorder,
+                      group_dim, frame_dim_.ysize_groups);
+  const size_t dc_group_dim = frame_dim_.dc_group_dim;
+  auto dx = CellRange(gx.first * group_dim, gx.second * group_dim, kBlockDim,
+                      dc_group_dim, frame_dim_.xsize_dc_groups);
+  auto dy = CellRange(gy.first * group_dim, gy.second * group_dim, kBlockDim,
+                      dc_group_dim, frame_dim_.ysize_dc_groups);
+  dc_group_needed_.assign(frame_dim_.num_dc_groups, JXL_FALSE);
+  for (size_t y = dy.first; y < dy.second; y++) {
+    for (size_t x = dx.first; x < dx.second; x++) {
+      dc_group_needed_[y * frame_dim_.xsize_dc_groups + x] = JXL_TRUE;
+    }
+  }
+  Image3F& dc = dec_state_->shared_storage.dc_storage;
+  for (size_t i = 0; i < frame_dim_.num_dc_groups; i++) {
+    if (dc_group_needed_[i]) continue;
+    decoded_dc_groups_[i] = JXL_TRUE;
+    // Defined values for the adaptive DC smoothing of the whole DC image.
+    if (frame_header_.encoding == FrameEncoding::kVarDCT &&
+        !(frame_header_.flags & FrameHeader::kUseDcFrame)) {
+      Rect rect = frame_dim_.DCGroupRect(i);
+      for (size_t c = 0; c < 3; c++) {
+        for (size_t y = 0; y < rect.ysize(); y++) {
+          float* JXL_RESTRICT row = rect.PlaneRow(&dc, c, y);
+          std::fill(row, row + rect.xsize(), 0.0f);
+        }
+      }
+    }
+  }
+  return true;
+}
+
+Status FrameDecoder::SelectACGroupsForRegion() {
+  if (dc_group_needed_.empty()) return true;
+  const Rect& region = dec_state_->output_region;
+  std::pair<size_t, size_t> border = dec_state_->render_pipeline->GroupBorder();
+  // The chosen DC groups cover all AC groups needed for this border.
+  JXL_ENSURE(border.first <= kMaxRegionGroupBorder &&
+             border.second <= kMaxRegionGroupBorder);
+  auto gx = CellRange(region.x0(), region.x1(), border.first,
+                      frame_dim_.group_dim, frame_dim_.xsize_groups);
+  auto gy = CellRange(region.y0(), region.y1(), border.second,
+                      frame_dim_.group_dim, frame_dim_.ysize_groups);
+  ac_group_needed_.assign(frame_dim_.num_groups, JXL_FALSE);
+  for (size_t g = 0; g < frame_dim_.num_groups; g++) {
+    size_t x = g % frame_dim_.xsize_groups;
+    size_t y = g / frame_dim_.xsize_groups;
+    if (x >= gx.first && x < gx.second && y >= gy.first && y < gy.second) {
+      ac_group_needed_[g] = JXL_TRUE;
+    } else {
+      decoded_passes_per_ac_group_[g] = frame_header_.passes.num_passes;
+    }
+  }
   return true;
 }
 
@@ -642,12 +758,19 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
     }
   }
 
+  if (decoded_dc_global_ && !region_groups_selected_) {
+    JXL_RETURN_IF_ERROR(SelectDCGroupsForRegion());
+  }
+
   if (decoded_dc_global_) {
     const auto process_section = [this, &dc_group_sec, &num, &sections,
                                   &section_status](size_t i,
                                                    size_t thread) -> Status {
       if (dc_group_sec[i] != num) {
-        JXL_RETURN_IF_ERROR(ProcessDCGroup(i, sections[dc_group_sec[i]].br));
+        // DC groups outside the output region are done without decoding.
+        if (dc_group_needed_.empty() || dc_group_needed_[i]) {
+          JXL_RETURN_IF_ERROR(ProcessDCGroup(i, sections[dc_group_sec[i]].br));
+        }
         section_status[dc_group_sec[i]] = SectionStatus::kDone;
       }
       return true;
@@ -668,6 +791,7 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
         pipeline_options));
     JXL_RETURN_IF_ERROR(FinalizeDC());
     JXL_RETURN_IF_ERROR(AllocateOutput());
+    JXL_RETURN_IF_ERROR(SelectACGroupsForRegion());
     if (progressive_detail_ >= JxlProgressiveDetail::kDC) {
       MarkSections(sections, num, section_status);
       return true;
@@ -690,6 +814,15 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
   }
 
   if (decoded_ac_global_) {
+    // AC groups outside the output region are done without decoding (passes
+    // may have been counted for them before they were chosen).
+    for (size_t g = 0; g < ac_group_needed_.size(); g++) {
+      if (ac_group_needed_[g]) continue;
+      desired_num_ac_passes[g] = 0;
+      for (size_t sec : ac_group_sec[g]) {
+        if (sec != num) section_status[sec] = SectionStatus::kDone;
+      }
+    }
     // Mark all the AC groups that we received as not complete yet.
     for (size_t i = 0; i < ac_group_sec.size(); i++) {
       if (desired_num_ac_passes[i] != 0) {

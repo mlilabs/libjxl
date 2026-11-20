@@ -28,6 +28,7 @@
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/cms/color_encoding_cms.h"
@@ -432,6 +433,10 @@ struct JxlDecoder {
   bool render_spotcolors;
   bool coalescing;
   float desired_intensity_target;
+  // Rectangle of the image that is output, in the coordinates of the output,
+  // if set by JxlDecoderSetImageRegion.
+  bool image_region_set;
+  jxl::Rect image_region;
 
   // Bitfield, for which informative events (JXL_DEC_BASIC_INFO, etc...) the
   // decoder returns a status. By default, do not return for any of the events,
@@ -829,6 +834,8 @@ void JxlDecoderReset(JxlDecoder* dec) {
 
   dec->thread_pool.reset();
   dec->keep_orientation = false;
+  dec->image_region_set = false;
+  dec->image_region = jxl::Rect();
   dec->unpremul_alpha = false;
   dec->render_spotcolors = true;
   dec->coalescing = true;
@@ -978,9 +985,39 @@ JxlDecoderStatus JxlDecoderSetCoalescing(JxlDecoder* dec, JXL_BOOL coalescing) {
   return JXL_DEC_SUCCESS;
 }
 
+JxlDecoderStatus JxlDecoderSetImageRegion(JxlDecoder* dec, uint32_t x0,
+                                          uint32_t y0, uint32_t xsize,
+                                          uint32_t ysize) {
+  if (!dec->got_basic_info) {
+    return JXL_API_ERROR("Basic info not yet available");
+  }
+  if (!dec->coalescing) {
+    return JXL_API_ERROR("Image region requires coalescing");
+  }
+  if (dec->image_out_buffer_set) {
+    return JXL_API_ERROR(
+        "Cannot change the image region while an image output is set");
+  }
+  if (x0 == 0 && y0 == 0 && xsize == 0 && ysize == 0) {
+    dec->image_region_set = false;
+    dec->image_region = jxl::Rect();
+    return JXL_DEC_SUCCESS;
+  }
+  size_t image_xsize = dec->metadata.oriented_xsize(dec->keep_orientation);
+  size_t image_ysize = dec->metadata.oriented_ysize(dec->keep_orientation);
+  if (xsize == 0 || ysize == 0 || x0 >= image_xsize || y0 >= image_ysize ||
+      xsize > image_xsize - x0 || ysize > image_ysize - y0) {
+    return JXL_API_ERROR("Image region outside of the image");
+  }
+  dec->image_region_set = true;
+  dec->image_region = jxl::Rect(x0, y0, xsize, ysize);
+  return JXL_DEC_SUCCESS;
+}
+
 namespace {
-// helper function to get the dimensions of the current image buffer
-void GetCurrentDimensions(const JxlDecoder* dec, size_t& xsize, size_t& ysize) {
+// helper function to get the dimensions of the current image, before
+// restricting the output to the region set by JxlDecoderSetImageRegion
+void GetFullDimensions(const JxlDecoder* dec, size_t& xsize, size_t& ysize) {
   if (dec->frame_header->nonserialized_is_preview) {
     xsize = dec->metadata.oriented_preview_xsize(dec->keep_orientation);
     ysize = dec->metadata.oriented_preview_ysize(dec->keep_orientation);
@@ -996,6 +1033,25 @@ void GetCurrentDimensions(const JxlDecoder* dec, size_t& xsize, size_t& ysize) {
         static_cast<int>(dec->metadata.m.GetOrientation()) > 4) {
       std::swap(xsize, ysize);
     }
+  }
+}
+
+// The region of the current image that is output, if one is set; it applies to
+// coalesced frames, not to the preview.
+const jxl::Rect* GetOutputRegion(const JxlDecoder* dec) {
+  if (!dec->image_region_set || !dec->coalescing ||
+      dec->frame_header->nonserialized_is_preview) {
+    return nullptr;
+  }
+  return &dec->image_region;
+}
+
+// helper function to get the dimensions of the current image buffer
+void GetCurrentDimensions(const JxlDecoder* dec, size_t& xsize, size_t& ysize) {
+  GetFullDimensions(dec, xsize, ysize);
+  if (const jxl::Rect* region = GetOutputRegion(dec)) {
+    xsize = region->xsize();
+    ysize = region->ysize();
   }
 }
 }  // namespace
@@ -1464,7 +1520,7 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
       if (dec->image_out_buffer_set) {
         size_t xsize;
         size_t ysize;
-        GetCurrentDimensions(dec, xsize, ysize);
+        GetFullDimensions(dec, xsize, ysize);
         size_t bits_per_sample = GetBitDepth(
             dec->image_out_bit_depth, dec->metadata.m, dec->image_out_format);
         JXL_API_RETURN_IF_ERROR(dec->frame_dec->SetImageOutput(
@@ -1473,7 +1529,9 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
                 dec->image_out_destroy_callback, dec->image_out_init_opaque},
             reinterpret_cast<uint8_t*>(dec->image_out_buffer),
             dec->image_out_size, xsize, ysize, dec->image_out_format,
-            bits_per_sample, dec->unpremul_alpha, !dec->keep_orientation));
+            bits_per_sample, dec->unpremul_alpha, !dec->keep_orientation,
+            GetOutputRegion(dec)));
+        GetCurrentDimensions(dec, xsize, ysize);
         for (size_t i = 0; i < dec->extra_channel_output.size(); ++i) {
           const auto& extra = dec->extra_channel_output[i];
           size_t ec_bits_per_sample =

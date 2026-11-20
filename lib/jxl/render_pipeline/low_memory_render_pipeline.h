@@ -39,6 +39,10 @@ class LowMemoryRenderPipeline final : public RenderPipeline {
 
   void ClearDone(size_t i) override { group_border_assigner_.ClearDone(i); }
 
+  std::pair<size_t, size_t> GroupBorder() const override {
+    return group_border_;
+  }
+
   Status Init() override;
 
   Status EnsureBordersStorage();

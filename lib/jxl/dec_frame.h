@@ -20,6 +20,7 @@
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/common.h"  // JXL_HIGH_PRECISION
 #include "lib/jxl/dec_bit_reader.h"
@@ -191,10 +192,19 @@ class FrameDecoder {
   // @param undo_orientation: if true, indicates the frame decoder should apply
   // the exif orientation to bring the image to the intended display
   // orientation.
+  //
+  // @param region: if not null, only this rectangle of the xsize x ysize
+  // image, in the coordinates of the output, is written to the output,
+  // relative to it; the output then has its size. Groups of the frame that do
+  // not contribute to it are not decoded, if the frame allows that.
   Status SetImageOutput(const PixelCallback& pixel_callback, void* image_buffer,
                         size_t image_buffer_size, size_t xsize, size_t ysize,
                         JxlPixelFormat format, size_t bits_per_sample,
-                        bool unpremul_alpha, bool undo_orientation) const {
+                        bool unpremul_alpha, bool undo_orientation,
+                        const Rect* region = nullptr) const {
+    const Rect oriented_region = region ? *region : Rect(0, 0, xsize, ysize);
+    JXL_ENSURE(oriented_region.xsize() > 0 && oriented_region.ysize() > 0 &&
+               oriented_region.x1() <= xsize && oriented_region.y1() <= ysize);
     dec_state_->width = xsize;
     dec_state_->height = ysize;
     dec_state_->main_output.format = format;
@@ -203,7 +213,7 @@ class FrameDecoder {
     dec_state_->main_output.buffer = image_buffer;
     dec_state_->main_output.buffer_size = image_buffer_size;
     JXL_ASSIGN_OR_RETURN(dec_state_->main_output.stride,
-                         GetStride(xsize, format));
+                         GetStride(oriented_region.xsize(), format));
     const jxl::ExtraChannelInfo* alpha =
         decoded_->metadata()->Find(jxl::ExtraChannel::kAlpha);
     if (alpha && alpha->alpha_associated && unpremul_alpha) {
@@ -215,9 +225,14 @@ class FrameDecoder {
         std::swap(dec_state_->width, dec_state_->height);
       }
     }
+    dec_state_->output_region =
+        OrientedToImageRect(oriented_region, dec_state_->undo_orientation,
+                            dec_state_->width, dec_state_->height);
     dec_state_->extra_output.clear();
 #if !JXL_HIGH_PRECISION
-    if (dec_state_->main_output.buffer &&
+    const bool whole_image =
+        oriented_region.xsize() == xsize && oriented_region.ysize() == ysize;
+    if (dec_state_->main_output.buffer && whole_image &&
         (format.data_type == JXL_TYPE_UINT8) && (format.num_channels >= 3) &&
         !dec_state_->unpremul_alpha &&
         (dec_state_->undo_orientation == Orientation::kIdentity) &&
@@ -258,6 +273,16 @@ class FrameDecoder {
                         bool dc_only);
   void MarkSections(const SectionInfo* sections, size_t num,
                     const SectionStatus* section_status);
+
+  // Whether the groups of the frame outside the output region need not be
+  // decoded: the frame is rendered by groups and only to the output.
+  bool CanSkipOutsideRegion() const;
+  // Chooses the DC groups needed for the output region, once the DC global
+  // section is decoded, and marks the others as decoded.
+  Status SelectDCGroupsForRegion();
+  // Chooses the AC groups needed for the output region, once the render
+  // pipeline is prepared, and marks the others as decoded.
+  Status SelectACGroupsForRegion();
 
   // Allocates storage for parallel decoding using up to `num_threads` threads
   // of up to `num_tasks` tasks. The value of `thread` passed to
@@ -330,6 +355,11 @@ class FrameDecoder {
   std::vector<uint8_t> processed_section_;
   std::vector<uint8_t> decoded_passes_per_ac_group_;
   std::vector<uint8_t> decoded_dc_groups_;
+  // Whether the groups needed for the output region are chosen, and which
+  // these are; empty if all groups are decoded.
+  bool region_groups_selected_ = false;
+  std::vector<uint8_t> dc_group_needed_;
+  std::vector<uint8_t> ac_group_needed_;
   bool decoded_dc_global_;
   bool decoded_ac_global_;
   bool HasEverything() const;

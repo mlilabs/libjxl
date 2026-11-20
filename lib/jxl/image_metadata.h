@@ -46,6 +46,27 @@ enum class Orientation : uint32_t {
 };
 // Don't need an EnumBits because Orientation is not read via Enum().
 
+// Undoing an orientation, i.e. bringing an image to its display orientation,
+// flips it horizontally and/or vertically, and then transposes it.
+static inline bool UndoOrientationFlipsX(Orientation undo_orientation) {
+  return (undo_orientation == Orientation::kFlipHorizontal ||
+          undo_orientation == Orientation::kRotate180 ||
+          undo_orientation == Orientation::kRotate270 ||
+          undo_orientation == Orientation::kAntiTranspose);
+}
+static inline bool UndoOrientationFlipsY(Orientation undo_orientation) {
+  return (undo_orientation == Orientation::kFlipVertical ||
+          undo_orientation == Orientation::kRotate180 ||
+          undo_orientation == Orientation::kRotate90 ||
+          undo_orientation == Orientation::kAntiTranspose);
+}
+static inline bool UndoOrientationTransposes(Orientation undo_orientation) {
+  return (undo_orientation == Orientation::kTranspose ||
+          undo_orientation == Orientation::kRotate90 ||
+          undo_orientation == Orientation::kRotate270 ||
+          undo_orientation == Orientation::kAntiTranspose);
+}
+
 enum class ExtraChannel : uint32_t {
   // First two enumerators (most common) are cheaper to encode
   kAlpha = JXL_CHANNEL_ALPHA,

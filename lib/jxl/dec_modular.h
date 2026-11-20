@@ -127,6 +127,11 @@ class ModularFrameDecoder {
   bool have_dc() const { return have_something; }
   void MaybeDropFullImage();
   bool UsesFullImage() const { return use_full_image; }
+  // Whether the full image is still used after MaybeDropFullImage(), known
+  // once the global info is decoded.
+  bool WillUseFullImage() const {
+    return !(full_image.transform.empty() && !have_something && all_same_shift);
+  }
   JxlMemoryManager* memory_manager() const { return memory_manager_; }
 
  private:

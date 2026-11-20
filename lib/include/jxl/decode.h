@@ -555,6 +555,39 @@ JxlDecoderSetRenderSpotcolors(JxlDecoder* dec, JXL_BOOL render_spotcolors);
 JXL_EXPORT JxlDecoderStatus JxlDecoderSetCoalescing(JxlDecoder* dec,
                                                     JXL_BOOL coalescing);
 
+/** Restricts the image output to a rectangle of the image. The image output
+ * (buffer or callback) and the extra channel outputs then contain only this
+ * region, as if it were the whole image: @ref JxlDecoderImageOutBufferSize,
+ * @ref JxlDecoderExtraChannelBufferSize and the layer size in @ref
+ * JxlDecoderGetFrameHeader return its size, and the pixel callbacks receive
+ * coordinates relative to it. The pixels are the same as those of the region
+ * when decoding the whole image. Parts of a frame that do not contribute to the
+ * region are not decoded, where the frame allows that, so decoding a small
+ * region of a large image is much faster.
+ *
+ * The region is given in the coordinates of the output, i.e. after applying
+ * the orientation unless @ref JxlDecoderSetKeepOrientation is set. It applies
+ * to the following frames, but not to the preview image or to JPEG
+ * reconstruction, and requires coalescing (see @ref JxlDecoderSetCoalescing).
+ * It can be set or changed after ::JXL_DEC_BASIC_INFO, whenever no image
+ * output buffer or callback is set for the current frame, e.g. at
+ * ::JXL_DEC_FRAME.
+ *
+ * @param dec decoder object
+ * @param x0 left edge of the region
+ * @param y0 top edge of the region
+ * @param xsize width of the region; 0 together with all other parameters 0
+ *     restores the output of the whole image
+ * @param ysize height of the region
+ * @return ::JXL_DEC_SUCCESS if no error, ::JXL_DEC_ERROR if the basic info is
+ *     not yet available, coalescing is disabled, an image output is set for
+ *     the current frame, or the region is empty or not inside the image.
+ */
+JXL_EXPORT JxlDecoderStatus JxlDecoderSetImageRegion(JxlDecoder* dec,
+                                                     uint32_t x0, uint32_t y0,
+                                                     uint32_t xsize,
+                                                     uint32_t ysize);
+
 /**
  * Decodes JPEG XL file using the available bytes. Requires input has been
  * set with @ref JxlDecoderSetInput. After @ref JxlDecoderProcessInput, input

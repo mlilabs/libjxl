@@ -116,6 +116,11 @@ class RenderPipeline {
 
   virtual void ClearDone(size_t i) {}
 
+  // Border around each group, in pixels of the frame in either direction, in
+  // which the rendering depends on the neighbouring groups, if the pipeline
+  // renders groups as their input becomes available.
+  virtual std::pair<size_t, size_t> GroupBorder() const { return {0, 0}; }
+
  protected:
   explicit RenderPipeline(JxlMemoryManager* memory_manager)
       : memory_manager_(memory_manager) {}

@@ -15,11 +15,13 @@
 #include <cstdint>
 #include <hwy/base.h>  // HWY_ALIGN_MAX
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "lib/jxl/base/common.h"  // kMaxNumPasses
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
+#include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/common.h"
 #include "lib/jxl/dct_util.h"
@@ -81,6 +83,25 @@ struct ImageOutput {
   size_t stride;
 };
 
+// The rectangle of a `xsize` x `ysize` image that becomes `oriented` when
+// undoing `undo_orientation`, i.e. when bringing the image to its display
+// orientation.
+static inline Rect OrientedToImageRect(const Rect& oriented,
+                                       Orientation undo_orientation,
+                                       size_t xsize, size_t ysize) {
+  size_t x0 = oriented.x0();
+  size_t y0 = oriented.y0();
+  size_t w = oriented.xsize();
+  size_t h = oriented.ysize();
+  if (UndoOrientationTransposes(undo_orientation)) {
+    std::swap(x0, y0);
+    std::swap(w, h);
+  }
+  if (UndoOrientationFlipsX(undo_orientation)) x0 = xsize - x0 - w;
+  if (UndoOrientationFlipsY(undo_orientation)) y0 = ysize - y0 - h;
+  return Rect(x0, y0, w, h);
+}
+
 // Per-frame decoder state. All the images here should be accessed through a
 // group rect (either with block units or pixel units).
 struct PassesDecoderState {
@@ -109,6 +130,9 @@ struct PassesDecoderState {
   // Image dimensions before applying undo_orientation.
   size_t width;
   size_t height;
+  // Rectangle of the image, before applying undo_orientation, that is written
+  // to the image output.
+  Rect output_region;
   ImageOutput main_output;
   std::vector<ImageOutput> extra_output;
 
@@ -164,6 +188,7 @@ struct PassesDecoderState {
     main_output.callback = PixelCallback();
     main_output.buffer = nullptr;
     extra_output.clear();
+    output_region = Rect();
 
     fast_xyb_srgb8_conversion = false;
     unpremul_alpha = false;
