@@ -128,7 +128,11 @@ class FrameDecoder {
   // Returns whether a DC image has been decoded, accessible at low resolution
   // at passes.shared_storage.dc_storage
   bool HasDecodedDC() const { return finalized_dc_; }
-  bool HasDecodedAll() const { return toc_.size() == num_sections_done_; }
+  // All sections are decoded, or all needed for the output when rendering the
+  // DC only.
+  bool HasDecodedAll() const {
+    return toc_.size() == num_sections_done_ || rendered_dc_only_;
+  }
 
   size_t NumCompletePasses() const {
     return *std::min_element(decoded_passes_per_ac_group_.begin(),
@@ -197,23 +201,29 @@ class FrameDecoder {
   // image, in the coordinates of the output, is written to the output,
   // relative to it; the output then has its size. Groups of the frame that do
   // not contribute to it are not decoded, if the frame allows that.
+  //
+  // @param downsampling: 1, or kBlockDim to output the image downsampled by
+  // it, rendered from the DC of the frame only (see CheckDCOnlyOutput); the
+  // output then contains the pixels of the downsampled image that cover the
+  // region (see DownsampledOutputRect).
   Status SetImageOutput(const PixelCallback& pixel_callback, void* image_buffer,
                         size_t image_buffer_size, size_t xsize, size_t ysize,
                         JxlPixelFormat format, size_t bits_per_sample,
                         bool unpremul_alpha, bool undo_orientation,
-                        const Rect* region = nullptr) const {
+                        const Rect* region = nullptr,
+                        size_t downsampling = 1) const {
     const Rect oriented_region = region ? *region : Rect(0, 0, xsize, ysize);
     JXL_ENSURE(oriented_region.xsize() > 0 && oriented_region.ysize() > 0 &&
                oriented_region.x1() <= xsize && oriented_region.y1() <= ysize);
+    JXL_ENSURE(downsampling == 1 || downsampling == kBlockDim);
     dec_state_->width = xsize;
     dec_state_->height = ysize;
+    dec_state_->output_downsampling = downsampling;
     dec_state_->main_output.format = format;
     dec_state_->main_output.bits_per_sample = bits_per_sample;
     dec_state_->main_output.callback = pixel_callback;
     dec_state_->main_output.buffer = image_buffer;
     dec_state_->main_output.buffer_size = image_buffer_size;
-    JXL_ASSIGN_OR_RETURN(dec_state_->main_output.stride,
-                         GetStride(oriented_region.xsize(), format));
     const jxl::ExtraChannelInfo* alpha =
         decoded_->metadata()->Find(jxl::ExtraChannel::kAlpha);
     if (alpha && alpha->alpha_associated && unpremul_alpha) {
@@ -225,13 +235,24 @@ class FrameDecoder {
         std::swap(dec_state_->width, dec_state_->height);
       }
     }
+    if (downsampling != 1) {
+      JXL_RETURN_IF_ERROR(CheckDCOnlyOutput(format));
+    }
+    const Rect output_rect =
+        DownsampledOutputRect(oriented_region, dec_state_->undo_orientation,
+                              xsize, ysize, downsampling);
+    dec_state_->width = DivCeil(dec_state_->width, downsampling);
+    dec_state_->height = DivCeil(dec_state_->height, downsampling);
+    JXL_ASSIGN_OR_RETURN(dec_state_->main_output.stride,
+                         GetStride(output_rect.xsize(), format));
     dec_state_->output_region =
-        OrientedToImageRect(oriented_region, dec_state_->undo_orientation,
+        OrientedToImageRect(output_rect, dec_state_->undo_orientation,
                             dec_state_->width, dec_state_->height);
     dec_state_->extra_output.clear();
 #if !JXL_HIGH_PRECISION
-    const bool whole_image =
-        oriented_region.xsize() == xsize && oriented_region.ysize() == ysize;
+    const bool whole_image = downsampling == 1 &&
+                             oriented_region.xsize() == xsize &&
+                             oriented_region.ysize() == ysize;
     if (dec_state_->main_output.buffer && whole_image &&
         (format.data_type == JXL_TYPE_UINT8) && (format.num_channels >= 3) &&
         !dec_state_->unpremul_alpha &&
@@ -250,6 +271,9 @@ class FrameDecoder {
 
   Status AddExtraChannelOutput(void* buffer, size_t buffer_size, size_t xsize,
                                JxlPixelFormat format, size_t bits_per_sample) {
+    if (dec_state_->output_downsampling != 1) {
+      return JXL_FAILURE("Extra channels cannot be output downsampled");
+    }
     ImageOutput out;
     out.format = format;
     out.bits_per_sample = bits_per_sample;
@@ -277,6 +301,14 @@ class FrameDecoder {
   // Whether the groups of the frame outside the output region need not be
   // decoded: the frame is rendered by groups and only to the output.
   bool CanSkipOutsideRegion() const;
+  // Whether the output is rendered from the DC of the frame only.
+  bool DCOnly() const { return dec_state_->output_downsampling != 1; }
+  // Checks that the frame can be output in `format` rendered from its DC only:
+  // a lossy frame that is shown as it is, and of which no extra channel is
+  // needed.
+  Status CheckDCOnlyOutput(const JxlPixelFormat& format) const;
+  // Renders the DC image to the output, once it is finalized.
+  Status RenderDCOnly();
   // Chooses the DC groups needed for the output region, once the DC global
   // section is decoded, and marks the others as decoded.
   Status SelectDCGroupsForRegion();
@@ -360,6 +392,8 @@ class FrameDecoder {
   bool region_groups_selected_ = false;
   std::vector<uint8_t> dc_group_needed_;
   std::vector<uint8_t> ac_group_needed_;
+  // Whether the DC image is rendered to the output, which completes the frame.
+  bool rendered_dc_only_ = false;
   bool decoded_dc_global_;
   bool decoded_ac_global_;
   bool HasEverything() const;

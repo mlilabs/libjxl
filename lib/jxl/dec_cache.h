@@ -102,6 +102,44 @@ static inline Rect OrientedToImageRect(const Rect& oriented,
   return Rect(x0, y0, w, h);
 }
 
+// The rectangle that `image`, a rectangle of a `xsize` x `ysize` image, becomes
+// when undoing `undo_orientation`; the inverse of OrientedToImageRect.
+static inline Rect ImageToOrientedRect(const Rect& image,
+                                       Orientation undo_orientation,
+                                       size_t xsize, size_t ysize) {
+  size_t x0 = image.x0();
+  size_t y0 = image.y0();
+  size_t w = image.xsize();
+  size_t h = image.ysize();
+  if (UndoOrientationFlipsX(undo_orientation)) x0 = xsize - x0 - w;
+  if (UndoOrientationFlipsY(undo_orientation)) y0 = ysize - y0 - h;
+  if (UndoOrientationTransposes(undo_orientation)) {
+    std::swap(x0, y0);
+    std::swap(w, h);
+  }
+  return Rect(x0, y0, w, h);
+}
+
+// The rectangle of the output image, i.e. of the image in its display
+// orientation downsampled by `downsampling`, that covers `oriented`, a
+// rectangle of the `xsize` x `ysize` image in its display orientation, which
+// is brought to it by undoing `undo_orientation`. The pixels of the downsampled
+// image are aligned to the image before undoing the orientation.
+static inline Rect DownsampledOutputRect(const Rect& oriented,
+                                         Orientation undo_orientation,
+                                         size_t xsize, size_t ysize,
+                                         size_t downsampling) {
+  if (UndoOrientationTransposes(undo_orientation)) std::swap(xsize, ysize);
+  Rect image = OrientedToImageRect(oriented, undo_orientation, xsize, ysize);
+  size_t x0 = image.x0() / downsampling;
+  size_t y0 = image.y0() / downsampling;
+  Rect downsampled(x0, y0, DivCeil(image.x1(), downsampling) - x0,
+                   DivCeil(image.y1(), downsampling) - y0);
+  return ImageToOrientedRect(downsampled, undo_orientation,
+                             DivCeil(xsize, downsampling),
+                             DivCeil(ysize, downsampling));
+}
+
 // Per-frame decoder state. All the images here should be accessed through a
 // group rect (either with block units or pixel units).
 struct PassesDecoderState {
@@ -133,6 +171,10 @@ struct PassesDecoderState {
   // Rectangle of the image, before applying undo_orientation, that is written
   // to the image output.
   Rect output_region;
+  // Factor by which the image output is downsampled: 1, or kBlockDim to render
+  // only the DC of the frame. width, height and output_region are in pixels of
+  // the downsampled image.
+  size_t output_downsampling = 1;
   ImageOutput main_output;
   std::vector<ImageOutput> extra_output;
 
@@ -189,6 +231,7 @@ struct PassesDecoderState {
     main_output.buffer = nullptr;
     extra_output.clear();
     output_region = Rect();
+    output_downsampling = 1;
 
     fast_xyb_srgb8_conversion = false;
     unpremul_alpha = false;

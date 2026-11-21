@@ -588,6 +588,46 @@ JXL_EXPORT JxlDecoderStatus JxlDecoderSetImageRegion(JxlDecoder* dec,
                                                      uint32_t xsize,
                                                      uint32_t ysize);
 
+/** Outputs the image downsampled by a factor. With the factor 8, the image is
+ * rendered from the 1/8 resolution DC of its frames only, which lossy (VarDCT)
+ * frames contain: the rest of the frames is neither decoded nor needed in the
+ * input, so decoding is much faster and only the first part of each frame has
+ * to be available, about a third of a typical lossy image. The pixels are the
+ * averages of 8x8 blocks of the image, but are not exactly the downsampled
+ * pixels of the decoded image: the filters, noise, patches and splines of the
+ * frames are not applied.
+ *
+ * The output image (buffer or callback) then has the size of the image divided
+ * by 8 and rounded up, which @ref JxlDecoderImageOutBufferSize and the layer
+ * size in @ref JxlDecoderGetFrameHeader return; the basic info still contains
+ * the size of the image. The blocks are aligned to the image in its coded
+ * orientation, so that with an orientation that flips the image the partial
+ * blocks at its right or bottom edge come first. A region set by @ref
+ * JxlDecoderSetImageRegion is still given in pixels of the image (not
+ * downsampled); the output then contains the pixels of the downsampled image
+ * that cover it.
+ *
+ * Decoding fails with ::JXL_DEC_ERROR for frames that cannot be rendered from
+ * their DC: lossless or other modular frames, frames that are upsampled,
+ * chroma subsampled, blended onto earlier frames or referenced by later ones,
+ * if alpha is requested in the output (the image output has 2 or 4 channels)
+ * and the image has alpha, and if spot colors are rendered (see @ref
+ * JxlDecoderSetRenderSpotcolors) and the image has spot colors. Extra channels
+ * cannot be output, @ref JxlDecoderExtraChannelBufferSize and @ref
+ * JxlDecoderSetExtraChannelBuffer fail. The factor applies to the following
+ * frames, but not to the preview image or to JPEG reconstruction, and requires
+ * coalescing (see @ref JxlDecoderSetCoalescing). It can be set or changed
+ * whenever no image output buffer or callback is set for the current frame.
+ *
+ * @param dec decoder object
+ * @param factor 1 (the default) for the image at full resolution, or 8
+ * @return ::JXL_DEC_SUCCESS if no error, ::JXL_DEC_ERROR if the factor is not
+ *     supported, coalescing is disabled, an image output is set for the
+ *     current frame, or extra channel outputs are set.
+ */
+JXL_EXPORT JxlDecoderStatus JxlDecoderSetImageDownsampling(JxlDecoder* dec,
+                                                           uint32_t factor);
+
 /**
  * Decodes JPEG XL file using the available bytes. Requires input has been
  * set with @ref JxlDecoderSetInput. After @ref JxlDecoderProcessInput, input

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -281,6 +282,7 @@ Status FrameDecoder::InitFrameOutput() {
   region_groups_selected_ = false;
   dc_group_needed_.clear();
   ac_group_needed_.clear();
+  rendered_dc_only_ = false;
   allocated_ = false;
   return true;
 }
@@ -316,23 +318,69 @@ bool FrameDecoder::CanSkipOutsideRegion() const {
   return true;
 }
 
+Status FrameDecoder::CheckDCOnlyOutput(const JxlPixelFormat& format) const {
+  if (frame_header_.encoding != FrameEncoding::kVarDCT) {
+    return JXL_FAILURE("Downsampled output requires a lossy (VarDCT) frame");
+  }
+  if (decoded_->IsJPEG()) {
+    return JXL_FAILURE("Downsampled output is not possible with JPEG output");
+  }
+  if ((frame_header_.frame_type != FrameType::kRegularFrame &&
+       frame_header_.frame_type != FrameType::kSkipProgressive) ||
+      frame_header_.CanBeReferenced() || NeedsBlending(frame_header_)) {
+    return JXL_FAILURE(
+        "Downsampled output requires a frame that is shown as it is");
+  }
+  if (frame_header_.upsampling != 1 ||
+      !frame_header_.chroma_subsampling.Is444()) {
+    return JXL_FAILURE(
+        "Downsampled output requires a frame without upsampling or chroma "
+        "subsampling");
+  }
+  const ImageMetadata& metadata = *decoded_->metadata();
+  if ((format.num_channels == 2 || format.num_channels == 4) &&
+      metadata.Find(ExtraChannel::kAlpha)) {
+    return JXL_FAILURE("Alpha cannot be output downsampled");
+  }
+  if (render_spotcolors_ && metadata.Find(ExtraChannel::kSpotColor)) {
+    return JXL_FAILURE("Spot colors cannot be rendered downsampled");
+  }
+  return true;
+}
+
 Status FrameDecoder::SelectDCGroupsForRegion() {
   JXL_ENSURE(decoded_dc_global_ && !region_groups_selected_);
   region_groups_selected_ = true;
-  if (!CanSkipOutsideRegion()) return true;
   const Rect& region = dec_state_->output_region;
-  // The pixels of all AC groups that may be needed, and the DC groups of these
-  // with the neighbouring blocks for adaptive DC smoothing.
-  const size_t group_dim = frame_dim_.group_dim;
-  auto gx = CellRange(region.x0(), region.x1(), kMaxRegionGroupBorder,
-                      group_dim, frame_dim_.xsize_groups);
-  auto gy = CellRange(region.y0(), region.y1(), kMaxRegionGroupBorder,
-                      group_dim, frame_dim_.ysize_groups);
-  const size_t dc_group_dim = frame_dim_.dc_group_dim;
-  auto dx = CellRange(gx.first * group_dim, gx.second * group_dim, kBlockDim,
-                      dc_group_dim, frame_dim_.xsize_dc_groups);
-  auto dy = CellRange(gy.first * group_dim, gy.second * group_dim, kBlockDim,
-                      dc_group_dim, frame_dim_.ysize_dc_groups);
+  std::pair<size_t, size_t> dx;
+  std::pair<size_t, size_t> dy;
+  if (DCOnly()) {
+    // The region is in blocks; the DC groups of it with the neighbouring
+    // blocks for adaptive DC smoothing.
+    if (frame_dim_.num_dc_groups == 1 ||
+        (region.xsize() >= frame_dim_.xsize_blocks &&
+         region.ysize() >= frame_dim_.ysize_blocks)) {
+      return true;
+    }
+    dx = CellRange(region.x0(), region.x1(), 1, frame_dim_.group_dim,
+                   frame_dim_.xsize_dc_groups);
+    dy = CellRange(region.y0(), region.y1(), 1, frame_dim_.group_dim,
+                   frame_dim_.ysize_dc_groups);
+  } else {
+    if (!CanSkipOutsideRegion()) return true;
+    // The pixels of all AC groups that may be needed, and the DC groups of
+    // these with the neighbouring blocks for adaptive DC smoothing.
+    const size_t group_dim = frame_dim_.group_dim;
+    auto gx = CellRange(region.x0(), region.x1(), kMaxRegionGroupBorder,
+                        group_dim, frame_dim_.xsize_groups);
+    auto gy = CellRange(region.y0(), region.y1(), kMaxRegionGroupBorder,
+                        group_dim, frame_dim_.ysize_groups);
+    const size_t dc_group_dim = frame_dim_.dc_group_dim;
+    dx = CellRange(gx.first * group_dim, gx.second * group_dim, kBlockDim,
+                   dc_group_dim, frame_dim_.xsize_dc_groups);
+    dy = CellRange(gy.first * group_dim, gy.second * group_dim, kBlockDim,
+                   dc_group_dim, frame_dim_.ysize_dc_groups);
+  }
   dc_group_needed_.assign(frame_dim_.num_dc_groups, JXL_FALSE);
   for (size_t y = dy.first; y < dy.second; y++) {
     for (size_t x = dx.first; x < dx.second; x++) {
@@ -379,6 +427,37 @@ Status FrameDecoder::SelectACGroupsForRegion() {
       decoded_passes_per_ac_group_[g] = frame_header_.passes.num_passes;
     }
   }
+  return true;
+}
+
+Status FrameDecoder::RenderDCOnly() {
+  const Image3F& dc = *dec_state_->shared->dc;
+  RenderPipeline* render_pipeline = dec_state_->render_pipeline.get();
+  // The DC groups outside the output region are rendered as well, with the
+  // values they got instead of being decoded; the output stage crops them.
+  const auto prepare_storage = [this](size_t num_threads) -> Status {
+    JXL_RETURN_IF_ERROR(PrepareStorage(num_threads, frame_dim_.num_dc_groups));
+    return true;
+  };
+  const auto render_group = [&](size_t g, size_t thread) -> Status {
+    RenderPipelineInput input =
+        render_pipeline->GetInputBuffers(g, GetStorageLocation(thread, g));
+    const Rect rect = frame_dim_.DCGroupRect(g);
+    for (size_t c = 0; c < 3; c++) {
+      const std::pair<ImageF*, Rect>& buffer = input.GetBuffer(c);
+      JXL_ENSURE(buffer.second.xsize() == rect.xsize() &&
+                 buffer.second.ysize() == rect.ysize());
+      for (size_t y = 0; y < rect.ysize(); y++) {
+        memcpy(buffer.second.Row(buffer.first, y), rect.ConstPlaneRow(dc, c, y),
+               rect.xsize() * sizeof(float));
+      }
+    }
+    JXL_RETURN_IF_ERROR(input.Done());
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, frame_dim_.num_dc_groups,
+                                prepare_storage, render_group, "RenderDC"));
+  rendered_dc_only_ = true;
   return true;
 }
 
@@ -439,6 +518,11 @@ Status FrameDecoder::ProcessDCGroup(size_t dc_group_id, BitReader* br) {
       !(frame_header_.flags & FrameHeader::kUseDcFrame)) {
     JXL_RETURN_IF_ERROR(modular_frame_decoder_.DecodeVarDCTDC(
         frame_header_, dc_group_id, br, dec_state_));
+  }
+  if (DCOnly()) {
+    // Neither the extra channels nor the AC metadata are needed.
+    decoded_dc_groups_[dc_group_id] = JXL_TRUE;
+    return true;
   }
   const Rect mrect(gx * frame_dim_.dc_group_dim, gy * frame_dim_.dc_group_dim,
                    frame_dim_.dc_group_dim, frame_dim_.dc_group_dim);
@@ -791,11 +875,27 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
         pipeline_options));
     JXL_RETURN_IF_ERROR(FinalizeDC());
     JXL_RETURN_IF_ERROR(AllocateOutput());
-    JXL_RETURN_IF_ERROR(SelectACGroupsForRegion());
-    if (progressive_detail_ >= JxlProgressiveDetail::kDC) {
+    if (DCOnly()) {
+      JXL_RETURN_IF_ERROR(RenderDCOnly());
+    } else {
+      JXL_RETURN_IF_ERROR(SelectACGroupsForRegion());
+    }
+    if (progressive_detail_ >= JxlProgressiveDetail::kDC &&
+        !rendered_dc_only_) {
       MarkSections(sections, num, section_status);
       return true;
     }
+  }
+
+  if (rendered_dc_only_) {
+    // The output is complete, the remaining sections are not needed.
+    for (size_t i = 0; i < num; i++) {
+      if (section_status[i] == SectionStatus::kSkipped) {
+        section_status[i] = SectionStatus::kDone;
+      }
+    }
+    MarkSections(sections, num, section_status);
+    return true;
   }
 
   if (finalized_dc_ && ac_global_sec != num && !decoded_ac_global_) {
@@ -886,6 +986,10 @@ Status FrameDecoder::Flush() {
     // Nothing to do.
     return true;
   }
+  if (DCOnly()) {
+    // The output is rendered as soon as the DC is decoded.
+    return true;
+  }
   JXL_RETURN_IF_ERROR(AllocateOutput());
 
   uint32_t completely_decoded_ac_pass = *std::min_element(
@@ -953,7 +1057,7 @@ int FrameDecoder::References() const {
   if (is_finalized_) {
     return 0;
   }
-  if (!HasEverything()) return 0;
+  if (!HasEverything() && !rendered_dc_only_) return 0;
 
   int result = 0;
 
@@ -993,7 +1097,7 @@ Status FrameDecoder::FinalizeFrame() {
     return JXL_FAILURE("FinalizeFrame called multiple times");
   }
   is_finalized_ = true;
-  if (decoded_->IsJPEG()) {
+  if (decoded_->IsJPEG() || rendered_dc_only_) {
     // Nothing to do.
     return true;
   }

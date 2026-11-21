@@ -7,6 +7,11 @@
 // as the region of the output of the whole image, for all orientations, pixel
 // formats and kinds of frames, and groups that do not contribute to the region
 // must not be decoded.
+//
+// Tests of JxlDecoderSetImageDownsampling: the image downsampled by 8 must
+// approximate the averages of the blocks of the decoded image, the region of it
+// must be the same as the region of the whole downsampled image, and only the
+// DC of the frame must be decoded and needed in the input.
 
 #include <jxl/codestream_header.h>
 #include <jxl/color_encoding.h>
@@ -19,6 +24,7 @@
 #include <jxl/types.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -67,6 +73,11 @@ struct EncodeParams {
   bool blend_frames = false;
   // Whether groups outside an output region are not decoded.
   bool skips = true;
+  // Whether the image can be output downsampled, as RGB.
+  bool downsamples = true;
+  // RGB pixels of xsize x ysize, 16 bits per sample in big endian, instead of
+  // a test image.
+  std::vector<uint8_t> pixels;
 };
 
 std::ostream& operator<<(std::ostream& os, const EncodeParams& p) {
@@ -84,6 +95,26 @@ std::vector<uint8_t> ExtraChannelPixels(size_t xsize, size_t ysize, size_t ec) {
     }
   }
   return pixels;
+}
+
+// The output of the encoder `enc`, of which the input is closed.
+std::vector<uint8_t> EncoderOutput(JxlEncoder* enc) {
+  std::vector<uint8_t> compressed(64);
+  uint8_t* next_out = compressed.data();
+  size_t avail_out = compressed.size();
+  JxlEncoderStatus status = JXL_ENC_NEED_MORE_OUTPUT;
+  while (status == JXL_ENC_NEED_MORE_OUTPUT) {
+    status = JxlEncoderProcessOutput(enc, &next_out, &avail_out);
+    if (status == JXL_ENC_NEED_MORE_OUTPUT) {
+      size_t offset = next_out - compressed.data();
+      compressed.resize(compressed.size() * 2);
+      next_out = compressed.data() + offset;
+      avail_out = compressed.size() - offset;
+    }
+  }
+  EXPECT_EQ(JXL_ENC_SUCCESS, status);
+  compressed.resize(next_out - compressed.data());
+  return compressed;
 }
 
 std::vector<uint8_t> Encode(const EncodeParams& p) {
@@ -152,8 +183,11 @@ std::vector<uint8_t> Encode(const EncodeParams& p) {
       }
       EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderSetFrameHeader(settings, &header));
     }
-    std::vector<uint8_t> pixels = jxl::test::GetSomeTestImage(
-        p.xsize, p.ysize, p.num_channels, static_cast<uint16_t>(f + 1));
+    std::vector<uint8_t> pixels =
+        p.pixels.empty()
+            ? jxl::test::GetSomeTestImage(p.xsize, p.ysize, p.num_channels,
+                                          static_cast<uint16_t>(f + 1))
+            : p.pixels;
     EXPECT_EQ(JXL_ENC_SUCCESS,
               JxlEncoderAddImageFrame(settings, &format, pixels.data(),
                                       pixels.size()));
@@ -165,23 +199,19 @@ std::vector<uint8_t> Encode(const EncodeParams& p) {
     }
   }
   JxlEncoderCloseInput(enc.get());
+  return EncoderOutput(enc.get());
+}
 
-  std::vector<uint8_t> compressed(64);
-  uint8_t* next_out = compressed.data();
-  size_t avail_out = compressed.size();
-  JxlEncoderStatus status = JXL_ENC_NEED_MORE_OUTPUT;
-  while (status == JXL_ENC_NEED_MORE_OUTPUT) {
-    status = JxlEncoderProcessOutput(enc.get(), &next_out, &avail_out);
-    if (status == JXL_ENC_NEED_MORE_OUTPUT) {
-      size_t offset = next_out - compressed.data();
-      compressed.resize(compressed.size() * 2);
-      next_out = compressed.data() + offset;
-      avail_out = compressed.size() - offset;
-    }
-  }
-  EXPECT_EQ(JXL_ENC_SUCCESS, status);
-  compressed.resize(next_out - compressed.data());
-  return compressed;
+// Encodes the JPEG `jpeg` losslessly.
+std::vector<uint8_t> EncodeJPEG(const std::vector<uint8_t>& jpeg) {
+  JxlEncoderPtr enc = JxlEncoderMake(nullptr);
+  EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderUseContainer(enc.get(), JXL_FALSE));
+  JxlEncoderFrameSettings* settings =
+      JxlEncoderFrameSettingsCreate(enc.get(), nullptr);
+  EXPECT_EQ(JXL_ENC_SUCCESS,
+            JxlEncoderAddJPEGFrame(settings, jpeg.data(), jpeg.size()));
+  JxlEncoderCloseInput(enc.get());
+  return EncoderOutput(enc.get());
 }
 
 struct DecodeParams {
@@ -195,6 +225,11 @@ struct DecodeParams {
   bool extra_channels = false;
   // Whether to output the image when the DC is complete, before the end.
   bool flush_after_dc = false;
+  // Factor by which the output is downsampled.
+  uint32_t downsampling = 1;
+  // Number of bytes of the input given to the decoder, all if 0; if not, the
+  // decoding ends with the first image.
+  size_t input_size = 0;
 };
 
 // The decoded image, or the images of the frames of an animation.
@@ -259,6 +294,10 @@ Decoded Decode(const std::vector<uint8_t>& data, const DecodeParams& p) {
   }
   EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSetKeepOrientation(
                                  dec.get(), TO_JXL_BOOL(p.keep_orientation)));
+  if (p.downsampling != 1) {
+    EXPECT_EQ(JXL_DEC_SUCCESS,
+              JxlDecoderSetImageDownsampling(dec.get(), p.downsampling));
+  }
   int events = JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE;
   if (p.flush_after_dc) {
     events |= JXL_DEC_FRAME_PROGRESSION;
@@ -266,7 +305,8 @@ Decoded Decode(const std::vector<uint8_t>& data, const DecodeParams& p) {
   }
   EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSubscribeEvents(dec.get(), events));
   EXPECT_EQ(JXL_DEC_SUCCESS,
-            JxlDecoderSetInput(dec.get(), data.data(), data.size()));
+            JxlDecoderSetInput(dec.get(), data.data(),
+                               p.input_size != 0 ? p.input_size : data.size()));
   JxlDecoderCloseInput(dec.get());
 
   JxlBasicInfo info;
@@ -335,6 +375,7 @@ Decoded Decode(const std::vector<uint8_t>& data, const DecodeParams& p) {
       EXPECT_FALSE(callback_output.out_of_bounds);
       result.frames.push_back(pixels);
       result.extra.push_back(extra);
+      if (p.input_size != 0) break;
     } else {
       ADD_FAILURE() << "unexpected status " << status;
       return result;
@@ -512,28 +553,34 @@ std::vector<EncodeParams> FrameCases() {
   cases.back().num_extra = 2;
   cases.push_back(Case("modular_lossless"));
   cases.back().distance = 0;
+  cases.back().downsamples = false;
   cases.push_back(Case("modular_lossless_group128",
                        {{JXL_ENC_FRAME_SETTING_MODULAR_GROUP_SIZE, 0}}));
   cases.back().distance = 0;
   cases.back().effort = 2;
   cases.back().num_channels = 4;
   cases.back().num_extra = 1;
+  cases.back().downsamples = false;
   // Squeezed over the whole image.
   cases.push_back(Case("modular_lossy", {{JXL_ENC_FRAME_SETTING_MODULAR, 1}}));
   cases.back().skips = false;
+  cases.back().downsamples = false;
   cases.push_back(
       Case("modular_responsive", {{JXL_ENC_FRAME_SETTING_MODULAR, 1},
                                   {JXL_ENC_FRAME_SETTING_RESPONSIVE, 1}}));
   cases.back().skips = false;
+  cases.back().downsamples = false;
   // Upsampled.
   cases.push_back(Case("resampling2", {{JXL_ENC_FRAME_SETTING_RESAMPLING, 2}}));
   cases.back().skips = false;
+  cases.back().downsamples = false;
   cases.push_back(Case("animation"));
   cases.back().num_frames = 3;
   cases.push_back(Case("animation_blended"));
   cases.back().num_channels = 4;
   cases.back().num_frames = 3;
   cases.back().blend_frames = true;
+  cases.back().downsamples = false;
   return cases;
 }
 
@@ -799,6 +846,547 @@ TEST(DecodeRegionTest, ApiErrors) {
             JxlDecoderSetInput(dec2.get(), data.data(), data.size()));
   EXPECT_EQ(JXL_DEC_BASIC_INFO, JxlDecoderProcessInput(dec2.get()));
   EXPECT_EQ(JXL_DEC_ERROR, JxlDecoderSetImageRegion(dec2.get(), 0, 0, 10, 10));
+}
+
+// The position of the pixel (x, y) of a xsize x ysize image in the image in
+// its display orientation, given by the EXIF `orientation`.
+std::pair<size_t, size_t> Oriented(size_t x, size_t y, size_t xsize,
+                                   size_t ysize, uint32_t orientation) {
+  switch (orientation) {
+    case 2:  // Flipped horizontally.
+      return {xsize - 1 - x, y};
+    case 3:  // Rotated by 180 degrees.
+      return {xsize - 1 - x, ysize - 1 - y};
+    case 4:  // Flipped vertically.
+      return {x, ysize - 1 - y};
+    case 5:  // Transposed.
+      return {y, x};
+    case 6:  // Rotated by 90 degrees clockwise.
+      return {ysize - 1 - y, x};
+    case 7:  // Anti-transposed.
+      return {ysize - 1 - y, xsize - 1 - x};
+    case 8:  // Rotated by 90 degrees counterclockwise.
+      return {y, xsize - 1 - x};
+    default:
+      return {x, y};
+  }
+}
+
+// The xsize x ysize image `pixels` of `format`, without row padding, in its
+// display orientation.
+std::vector<uint8_t> Orient(const std::vector<uint8_t>& pixels, size_t xsize,
+                            size_t ysize, const JxlPixelFormat& format,
+                            uint32_t orientation) {
+  size_t pixel_size = format.num_channels * BytesPerSample(format.data_type);
+  size_t oriented_xsize = orientation > 4 ? ysize : xsize;
+  std::vector<uint8_t> out(pixels.size());
+  for (size_t y = 0; y < ysize; y++) {
+    for (size_t x = 0; x < xsize; x++) {
+      std::pair<size_t, size_t> o = Oriented(x, y, xsize, ysize, orientation);
+      memcpy(out.data() + (o.second * oriented_xsize + o.first) * pixel_size,
+             pixels.data() + (y * xsize + x) * pixel_size, pixel_size);
+    }
+  }
+  return out;
+}
+
+// The rectangle of the downsampled image in its display orientation that
+// covers `region` of the image in its display orientation, which has xsize x
+// ysize pixels in its coded orientation, in which the blocks are aligned.
+Rect DownsampledRegion(const Rect& region, size_t xsize, size_t ysize,
+                       uint32_t orientation) {
+  size_t xblocks = DivCeil(xsize, kBlockDim);
+  size_t yblocks = DivCeil(ysize, kBlockDim);
+  size_t x0 = xsize;
+  size_t y0 = ysize;
+  size_t x1 = 0;
+  size_t y1 = 0;
+  for (size_t by = 0; by < yblocks; by++) {
+    for (size_t bx = 0; bx < xblocks; bx++) {
+      std::pair<size_t, size_t> a =
+          Oriented(bx * kBlockDim, by * kBlockDim, xsize, ysize, orientation);
+      std::pair<size_t, size_t> b =
+          Oriented(std::min(bx * kBlockDim + kBlockDim, xsize) - 1,
+                   std::min(by * kBlockDim + kBlockDim, ysize) - 1, xsize,
+                   ysize, orientation);
+      Rect block(
+          std::min(a.first, b.first), std::min(a.second, b.second),
+          std::max(a.first, b.first) - std::min(a.first, b.first) + 1,
+          std::max(a.second, b.second) - std::min(a.second, b.second) + 1);
+      if (!Near(block, region, 0)) continue;
+      std::pair<size_t, size_t> d =
+          Oriented(bx, by, xblocks, yblocks, orientation);
+      x0 = std::min(x0, d.first);
+      y0 = std::min(y0, d.second);
+      x1 = std::max(x1, d.first + 1);
+      y1 = std::max(y1, d.second + 1);
+    }
+  }
+  return Rect(x0, y0, x1 - x0, y1 - y0);
+}
+
+// Decodes `data`, with xsize x ysize pixels in its coded orientation and the
+// EXIF `orientation`, downsampled whole and with `region`, and checks that the
+// region is the part of the whole downsampled image that covers it.
+void ExpectDownsampledRegionOfWhole(const std::vector<uint8_t>& data,
+                                    DecodeParams p, const Rect& region,
+                                    size_t xsize, size_t ysize,
+                                    uint32_t orientation) {
+  p.downsampling = 8;
+  p.region = Rect();
+  Decoded whole = Decode(data, p);
+  ASSERT_TRUE(whole.success);
+  p.region = region;
+  Decoded part = Decode(data, p);
+  ASSERT_TRUE(part.success);
+  Rect expected = DownsampledRegion(region, xsize, ysize,
+                                    p.keep_orientation ? 1 : orientation);
+  EXPECT_EQ(expected.xsize(), part.xsize);
+  EXPECT_EQ(expected.ysize(), part.ysize);
+  ASSERT_EQ(whole.frames.size(), part.frames.size());
+  for (size_t f = 0; f < whole.frames.size(); f++) {
+    EXPECT_TRUE(Crop(whole.frames[f], whole.xsize, p.format, expected) ==
+                part.frames[f])
+        << "frame " << f;
+  }
+}
+
+std::vector<float> Floats(const std::vector<uint8_t>& bytes) {
+  std::vector<float> floats(bytes.size() / sizeof(float));
+  memcpy(floats.data(), bytes.data(), floats.size() * sizeof(float));
+  return floats;
+}
+
+// The averages of the parts of the blocks of 8 x 8 pixels inside the xsize x
+// ysize RGB image `pixels`.
+std::vector<float> BlockAverages(const std::vector<float>& pixels, size_t xsize,
+                                 size_t ysize) {
+  size_t xblocks = DivCeil(xsize, kBlockDim);
+  size_t yblocks = DivCeil(ysize, kBlockDim);
+  std::vector<float> sums(xblocks * yblocks * 3, 0.0f);
+  std::vector<size_t> counts(xblocks * yblocks, 0);
+  for (size_t y = 0; y < ysize; y++) {
+    for (size_t x = 0; x < xsize; x++) {
+      size_t b = (y / kBlockDim) * xblocks + x / kBlockDim;
+      for (size_t c = 0; c < 3; c++) {
+        sums[b * 3 + c] += pixels[(y * xsize + x) * 3 + c];
+      }
+      counts[b]++;
+    }
+  }
+  for (size_t i = 0; i < sums.size(); i++) sums[i] /= counts[i / 3];
+  return sums;
+}
+
+// Decodes `data` whole and downsampled, and checks that the downsampled image
+// approximates the averages of the blocks of the image, with a mean and a
+// maximum of the absolute differences of the samples of RGB in [0, 1] up to
+// `max_mean` and `max_max`.
+void ExpectApproximatesBlockAverages(const std::vector<uint8_t>& data,
+                                     float max_mean, float max_max) {
+  DecodeParams p;
+  p.format = {3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
+  p.keep_orientation = true;
+  p.num_threads = 4;
+  Decoded whole = Decode(data, p);
+  ASSERT_TRUE(whole.success);
+  p.downsampling = 8;
+  Decoded small = Decode(data, p);
+  ASSERT_TRUE(small.success);
+  ASSERT_EQ(DivCeil(whole.xsize, kBlockDim), small.xsize);
+  ASSERT_EQ(DivCeil(whole.ysize, kBlockDim), small.ysize);
+  ASSERT_EQ(whole.frames.size(), small.frames.size());
+  for (size_t f = 0; f < whole.frames.size(); f++) {
+    std::vector<float> expected =
+        BlockAverages(Floats(whole.frames[f]), whole.xsize, whole.ysize);
+    std::vector<float> actual = Floats(small.frames[f]);
+    ASSERT_EQ(expected.size(), actual.size());
+    double sum = 0;
+    float max = 0;
+    for (size_t i = 0; i < expected.size(); i++) {
+      float d = std::abs(expected[i] - actual[i]);
+      sum += d;
+      max = std::max(max, d);
+    }
+    float mean = sum / expected.size();
+    EXPECT_LE(mean, max_mean) << "frame " << f;
+    EXPECT_LE(max, max_max) << "frame " << f;
+  }
+}
+
+TEST(DecodeDownsamplingTest, Size) {
+  EncodeParams e;
+  e.name = "size";
+  e.xsize = 601;
+  e.ysize = 449;
+  e.orientation = JXL_ORIENT_ROTATE_90_CW;
+  std::vector<uint8_t> data = Encode(e);
+  for (bool keep_orientation : {false, true}) {
+    DecodeParams p;
+    p.format = {3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+    p.downsampling = 8;
+    p.keep_orientation = keep_orientation;
+    Decoded d = Decode(data, p);
+    ASSERT_TRUE(d.success);
+    EXPECT_EQ(keep_orientation ? 76u : 57u, d.xsize);
+    EXPECT_EQ(keep_orientation ? 57u : 76u, d.ysize);
+  }
+}
+
+// Images of one group, of which all is in one section.
+TEST(DecodeDownsamplingTest, SmallImages) {
+  for (std::pair<size_t, size_t> size :
+       {std::make_pair<size_t, size_t>(1, 1),
+        std::make_pair<size_t, size_t>(9, 7),
+        std::make_pair<size_t, size_t>(200, 150)}) {
+    SCOPED_TRACE(testing::Message() << size.first << "x" << size.second);
+    EncodeParams e;
+    e.name = "small";
+    e.xsize = size.first;
+    e.ysize = size.second;
+    std::vector<uint8_t> data = Encode(e);
+    ExpectApproximatesBlockAverages(data, 0.02f, 0.4f);
+    ExpectDownsampledRegionOfWhole(data, DecodeParams(),
+                                   Rect(0, 0, e.xsize / 2 + 1, e.ysize / 2 + 1),
+                                   e.xsize, e.ysize, 1);
+  }
+}
+
+TEST(DecodeDownsamplingTest, Orientations) {
+  for (uint32_t orientation = 1; orientation <= 8; orientation++) {
+    SCOPED_TRACE(testing::Message() << "orientation " << orientation);
+    EncodeParams e;
+    e.name = "orientation";
+    e.xsize = 603;
+    e.ysize = 450;
+    e.orientation = static_cast<JxlOrientation>(orientation);
+    std::vector<uint8_t> data = Encode(e);
+    // The downsampled image in its display orientation is the downsampled
+    // image in its coded orientation, oriented.
+    DecodeParams p;
+    p.format = {3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
+    p.downsampling = 8;
+    p.keep_orientation = true;
+    Decoded coded = Decode(data, p);
+    ASSERT_TRUE(coded.success);
+    p.keep_orientation = false;
+    Decoded shown = Decode(data, p);
+    ASSERT_TRUE(shown.success);
+    EXPECT_TRUE(Orient(coded.frames[0], coded.xsize, coded.ysize, p.format,
+                       orientation) == shown.frames[0]);
+    for (bool keep_orientation : {false, true}) {
+      for (JxlDataType type : {JXL_TYPE_UINT8, JXL_TYPE_FLOAT}) {
+        SCOPED_TRACE(testing::Message()
+                     << "keep orientation " << keep_orientation << ", type "
+                     << type);
+        p.format = {4, type, JXL_NATIVE_ENDIAN, 0};
+        p.keep_orientation = keep_orientation;
+        ExpectDownsampledRegionOfWhole(data, p, Rect(100, 70, 250, 260),
+                                       e.xsize, e.ysize, orientation);
+      }
+    }
+  }
+}
+
+TEST(DecodeDownsamplingTest, PixelFormats) {
+  EncodeParams e;
+  e.name = "formats";
+  std::vector<uint8_t> data = Encode(e);
+  std::vector<JxlPixelFormat> formats = {
+      {3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0},
+      {4, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0},
+      {3, JXL_TYPE_UINT16, JXL_BIG_ENDIAN, 0},
+      {4, JXL_TYPE_FLOAT16, JXL_NATIVE_ENDIAN, 0},
+      {3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0},
+      {3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 64},
+  };
+  for (const JxlPixelFormat& format : formats) {
+    for (bool use_callback : {false, true}) {
+      for (size_t num_threads : {0, 4}) {
+        SCOPED_TRACE(testing::Message()
+                     << "channels " << format.num_channels << ", type "
+                     << format.data_type << ", align " << format.align
+                     << ", callback " << use_callback << ", threads "
+                     << num_threads);
+        DecodeParams p;
+        p.format = format;
+        p.use_callback = use_callback;
+        p.num_threads = num_threads;
+        ExpectDownsampledRegionOfWhole(data, p, Rect(203, 117, 301, 222),
+                                       e.xsize, e.ysize, 1);
+      }
+    }
+  }
+}
+
+TEST(DecodeDownsamplingTest, Positions) {
+  EncodeParams e;
+  e.name = "positions";
+  e.xsize = 700;
+  e.ysize = 530;
+  std::vector<uint8_t> data = Encode(e);
+  std::vector<Rect> regions = {
+      Rect(0, 0, 1, 1),     Rect(699, 529, 1, 1),     Rect(7, 7, 2, 2),
+      Rect(8, 8, 8, 8),     Rect(255, 255, 2, 2),     Rect(0, 300, 700, 17),
+      Rect(511, 0, 3, 530), Rect(1, 1, 698, 528),     Rect(0, 0, 700, 530),
+      Rect(696, 528, 4, 2), Rect(600, 400, 100, 130),
+  };
+  for (const Rect& region : regions) {
+    for (size_t num_threads : {0, 3}) {
+      SCOPED_TRACE(testing::Message() << "region " << Description(region)
+                                      << ", threads " << num_threads);
+      DecodeParams p;
+      p.num_threads = num_threads;
+      ExpectDownsampledRegionOfWhole(data, p, region, e.xsize, e.ysize, 1);
+    }
+  }
+}
+
+class DecodeDownsamplingFrameTest
+    : public ::testing::TestWithParam<EncodeParams> {};
+
+JXL_GTEST_INSTANTIATE_TEST_SUITE_P(DecodeDownsamplingFrameTestInstantiation,
+                                   DecodeDownsamplingFrameTest,
+                                   testing::ValuesIn(FrameCases()),
+                                   testing::PrintToStringParamName());
+
+TEST_P(DecodeDownsamplingFrameTest, ApproximatesBlockAverages) {
+  const EncodeParams& e = GetParam();
+  std::vector<uint8_t> data = Encode(e);
+  if (!e.downsamples) {
+    DecodeParams p;
+    p.format = {3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
+    p.downsampling = 8;
+    EXPECT_FALSE(Decode(data, p).success);
+    return;
+  }
+  // The test images have a rectangle of noise, where averages in XYB and in
+  // RGB differ much.
+  ExpectApproximatesBlockAverages(data, 0.02f, 0.4f);
+}
+
+TEST_P(DecodeDownsamplingFrameTest, RegionOfWhole) {
+  const EncodeParams& e = GetParam();
+  if (!e.downsamples) GTEST_SKIP() << "not downsampled";
+  std::vector<uint8_t> data = Encode(e);
+  for (size_t num_threads : {0, 4}) {
+    SCOPED_TRACE(testing::Message() << "threads " << num_threads);
+    DecodeParams p;
+    p.format = {3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
+    p.num_threads = num_threads;
+    ExpectDownsampledRegionOfWhole(data, p, Rect(130, 90, 300, 250), e.xsize,
+                                   e.ysize, 1);
+  }
+}
+
+// The sections of the last frame of `data` up to the DC groups need to be
+// read, the others not.
+TEST_P(DecodeDownsamplingFrameTest, ReadsDCOnly) {
+  const EncodeParams& e = GetParam();
+  if (!e.downsamples) GTEST_SKIP() << "not downsampled";
+  if (e.num_frames > 0) GTEST_SKIP() << "only for still images";
+  std::vector<uint8_t> data = Encode(e);
+  FrameDimensions frame_dim;
+  std::vector<std::pair<size_t, size_t>> sections;
+  size_t upsampling;
+  ASSERT_NO_FATAL_FAILURE(
+      FrameSections(data, &frame_dim, &sections, &upsampling));
+  ASSERT_LT(1u + frame_dim.num_dc_groups, sections.size());
+  // Garbage in the AC global and AC group sections.
+  std::vector<uint8_t> corrupted = data;
+  Rng rng(1);
+  for (size_t id = 1 + frame_dim.num_dc_groups; id < sections.size(); id++) {
+    for (size_t i = 0; i < sections[id].second; i++) {
+      corrupted[sections[id].first + i] = rng.UniformU(0, 256);
+    }
+  }
+  // The end of the DC sections.
+  size_t dc_end = 0;
+  for (size_t id = 0; id <= frame_dim.num_dc_groups; id++) {
+    dc_end = std::max(dc_end, sections[id].first + sections[id].second);
+  }
+  EXPECT_LT(dc_end, data.size() / 2);
+  for (size_t num_threads : {0, 4}) {
+    SCOPED_TRACE(testing::Message() << "threads " << num_threads);
+    DecodeParams p;
+    p.format = {3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
+    p.downsampling = 8;
+    p.num_threads = num_threads;
+    Decoded expected = Decode(data, p);
+    ASSERT_TRUE(expected.success);
+    Decoded from_corrupted = Decode(corrupted, p);
+    EXPECT_TRUE(from_corrupted.success &&
+                from_corrupted.frames == expected.frames);
+    p.input_size = dc_end;
+    Decoded from_part = Decode(data, p);
+    EXPECT_TRUE(from_part.success && from_part.frames == expected.frames);
+    // The DC sections are needed.
+    p.input_size = dc_end - 1;
+    EXPECT_FALSE(Decode(data, p).success);
+  }
+}
+
+TEST(DecodeDownsamplingTest, SkipsDCGroupsOutsideRegion) {
+  EncodeParams e;
+  e.name = "large";
+  e.xsize = 2300;
+  e.ysize = 2150;
+  std::vector<uint8_t> data = Encode(e);
+  FrameDimensions frame_dim;
+  std::vector<std::pair<size_t, size_t>> sections;
+  size_t upsampling;
+  ASSERT_NO_FATAL_FAILURE(
+      FrameSections(data, &frame_dim, &sections, &upsampling));
+  ASSERT_EQ(4u, frame_dim.num_dc_groups);
+
+  // Regions and the number of DC groups not needed for them; at the border of
+  // DC groups the adaptive DC smoothing needs the neighbouring group.
+  std::vector<std::pair<Rect, size_t>> regions = {
+      {Rect(300, 400, 200, 150), 3}, {Rect(2100, 100, 150, 100), 3},
+      {Rect(2048, 1000, 8, 8), 2},   {Rect(1000, 2040, 8, 8), 2},
+      {Rect(2040, 2040, 16, 16), 0},
+  };
+  for (const auto& region_and_skipped : regions) {
+    const Rect& region = region_and_skipped.first;
+    SCOPED_TRACE(testing::Message() << "region " << Description(region));
+    // Garbage in the AC sections and the DC groups farther than a block from
+    // the blocks of the region.
+    Rect blocks(region.x0() / kBlockDim, region.y0() / kBlockDim,
+                DivCeil(region.x1(), kBlockDim) - region.x0() / kBlockDim,
+                DivCeil(region.y1(), kBlockDim) - region.y0() / kBlockDim);
+    std::vector<uint8_t> corrupted = data;
+    Rng rng(1);
+    size_t num_dc_groups = 0;
+    for (size_t id = 1; id < sections.size(); id++) {
+      if (id <= frame_dim.num_dc_groups) {
+        if (Near(frame_dim.DCGroupRect(id - 1), blocks, 1)) continue;
+        num_dc_groups++;
+      }
+      for (size_t i = 0; i < sections[id].second; i++) {
+        corrupted[sections[id].first + i] = rng.UniformU(0, 256);
+      }
+    }
+    EXPECT_EQ(region_and_skipped.second, num_dc_groups);
+    DecodeParams p;
+    p.downsampling = 8;
+    p.num_threads = 4;
+    p.region = region;
+    Decoded expected = Decode(data, p);
+    ASSERT_TRUE(expected.success);
+    Decoded part = Decode(corrupted, p);
+    EXPECT_TRUE(part.success && part.frames == expected.frames);
+    ExpectDownsampledRegionOfWhole(data, DecodeParams(), region, e.xsize,
+                                   e.ysize, 1);
+  }
+}
+
+TEST(DecodeDownsamplingTest, Photo) {
+  // A JPEG, transcoded losslessly.
+  std::vector<uint8_t> data = EncodeJPEG(
+      jxl::test::ReadTestData("jxl/flower/flower.png.im_q85_444.jpg"));
+  ExpectApproximatesBlockAverages(data, 0.0001f, 0.1f);
+  // The photo lossy in XYB.
+  DecodeParams p;
+  p.format = {3, JXL_TYPE_UINT16, JXL_BIG_ENDIAN, 0};
+  Decoded photo = Decode(data, p);
+  ASSERT_TRUE(photo.success);
+  EncodeParams e;
+  e.xsize = photo.xsize;
+  e.ysize = photo.ysize;
+  e.pixels = photo.frames[0];
+  for (int64_t effort : {3, 7}) {
+    SCOPED_TRACE(testing::Message() << "effort " << effort);
+    e.effort = effort;
+    ExpectApproximatesBlockAverages(Encode(e), 0.004f, 0.15f);
+  }
+  // Chroma subsampled.
+  data = EncodeJPEG(
+      jxl::test::ReadTestData("jxl/flower/flower.png.im_q85_420.jpg"));
+  p.format = {3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+  ASSERT_TRUE(Decode(data, p).success);
+  p.downsampling = 8;
+  EXPECT_FALSE(Decode(data, p).success);
+}
+
+TEST(DecodeDownsamplingTest, ApiErrors) {
+  EncodeParams e;
+  e.name = "api";
+  e.num_channels = 4;
+  e.num_extra = 1;
+  std::vector<uint8_t> data = Encode(e);
+  JxlDecoderPtr dec = JxlDecoderMake(nullptr);
+  for (uint32_t factor : {0, 2, 4, 16}) {
+    EXPECT_EQ(JXL_DEC_ERROR, JxlDecoderSetImageDownsampling(dec.get(), factor));
+  }
+  // Before the basic info.
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSetImageDownsampling(dec.get(), 8));
+  EXPECT_EQ(JXL_DEC_ERROR, JxlDecoderSetCoalescing(dec.get(), JXL_FALSE));
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSubscribeEvents(
+                                 dec.get(), JXL_DEC_BASIC_INFO | JXL_DEC_FRAME |
+                                                JXL_DEC_FULL_IMAGE));
+  EXPECT_EQ(JXL_DEC_SUCCESS,
+            JxlDecoderSetInput(dec.get(), data.data(), data.size()));
+  JxlDecoderCloseInput(dec.get());
+  EXPECT_EQ(JXL_DEC_BASIC_INFO, JxlDecoderProcessInput(dec.get()));
+  JxlBasicInfo info;
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderGetBasicInfo(dec.get(), &info));
+  EXPECT_EQ(640u, info.xsize);
+  EXPECT_EQ(480u, info.ysize);
+  EXPECT_EQ(JXL_DEC_FRAME, JxlDecoderProcessInput(dec.get()));
+  JxlFrameHeader header;
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderGetFrameHeader(dec.get(), &header));
+  EXPECT_EQ(80u, header.layer_info.xsize);
+  EXPECT_EQ(60u, header.layer_info.ysize);
+  JxlPixelFormat format = {3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+  size_t size;
+  EXPECT_EQ(JXL_DEC_SUCCESS,
+            JxlDecoderImageOutBufferSize(dec.get(), &format, &size));
+  EXPECT_EQ(80u * 60u * 3u, size);
+  // With a region.
+  EXPECT_EQ(JXL_DEC_SUCCESS,
+            JxlDecoderSetImageRegion(dec.get(), 100, 50, 30, 20));
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderGetFrameHeader(dec.get(), &header));
+  EXPECT_EQ(5u, header.layer_info.xsize);
+  EXPECT_EQ(3u, header.layer_info.ysize);
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSetImageRegion(dec.get(), 0, 0, 0, 0));
+  // No extra channels.
+  JxlPixelFormat ec_format = {1, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+  EXPECT_EQ(JXL_DEC_ERROR,
+            JxlDecoderExtraChannelBufferSize(dec.get(), &ec_format, &size, 1));
+  // The whole image again, with an extra channel.
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSetImageDownsampling(dec.get(), 1));
+  EXPECT_EQ(JXL_DEC_SUCCESS,
+            JxlDecoderImageOutBufferSize(dec.get(), &format, &size));
+  EXPECT_EQ(640u * 480u * 3u, size);
+  EXPECT_EQ(JXL_DEC_SUCCESS,
+            JxlDecoderExtraChannelBufferSize(dec.get(), &ec_format, &size, 1));
+  std::vector<uint8_t> ec_pixels(size);
+  EXPECT_EQ(JXL_DEC_SUCCESS,
+            JxlDecoderSetExtraChannelBuffer(dec.get(), &ec_format,
+                                            ec_pixels.data(), size, 1));
+  EXPECT_EQ(JXL_DEC_ERROR, JxlDecoderSetImageDownsampling(dec.get(), 8));
+  // Not while an output is set.
+  EXPECT_EQ(JXL_DEC_SUCCESS,
+            JxlDecoderImageOutBufferSize(dec.get(), &format, &size));
+  std::vector<uint8_t> pixels(size);
+  EXPECT_EQ(JXL_DEC_SUCCESS,
+            JxlDecoderSetImageOutBuffer(dec.get(), &format, pixels.data(),
+                                        pixels.size()));
+  EXPECT_EQ(JXL_DEC_ERROR, JxlDecoderSetImageDownsampling(dec.get(), 1));
+  EXPECT_EQ(JXL_DEC_FULL_IMAGE, JxlDecoderProcessInput(dec.get()));
+
+  // Not without coalescing.
+  JxlDecoderPtr dec2 = JxlDecoderMake(nullptr);
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSetCoalescing(dec2.get(), JXL_FALSE));
+  EXPECT_EQ(JXL_DEC_ERROR, JxlDecoderSetImageDownsampling(dec2.get(), 8));
+
+  // The image has alpha, which cannot be output.
+  DecodeParams p;
+  p.downsampling = 8;
+  p.format = {4, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+  EXPECT_FALSE(Decode(data, p).success);
+  p.format = {3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+  EXPECT_TRUE(Decode(data, p).success);
 }
 
 }  // namespace

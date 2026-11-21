@@ -437,6 +437,9 @@ struct JxlDecoder {
   // if set by JxlDecoderSetImageRegion.
   bool image_region_set;
   jxl::Rect image_region;
+  // Factor by which the image output is downsampled, set by
+  // JxlDecoderSetImageDownsampling.
+  uint32_t image_downsampling;
 
   // Bitfield, for which informative events (JXL_DEC_BASIC_INFO, etc...) the
   // decoder returns a status. By default, do not return for any of the events,
@@ -836,6 +839,7 @@ void JxlDecoderReset(JxlDecoder* dec) {
   dec->keep_orientation = false;
   dec->image_region_set = false;
   dec->image_region = jxl::Rect();
+  dec->image_downsampling = 1;
   dec->unpremul_alpha = false;
   dec->render_spotcolors = true;
   dec->coalescing = true;
@@ -981,6 +985,9 @@ JxlDecoderStatus JxlDecoderSetCoalescing(JxlDecoder* dec, JXL_BOOL coalescing) {
   if (dec->stage != DecoderStage::kInited) {
     return JXL_API_ERROR("Must set coalescing option before starting");
   }
+  if (!coalescing && dec->image_downsampling != 1) {
+    return JXL_API_ERROR("Image downsampling requires coalescing");
+  }
   dec->coalescing = FROM_JXL_BOOL(coalescing);
   return JXL_DEC_SUCCESS;
 }
@@ -1011,6 +1018,25 @@ JxlDecoderStatus JxlDecoderSetImageRegion(JxlDecoder* dec, uint32_t x0,
   }
   dec->image_region_set = true;
   dec->image_region = jxl::Rect(x0, y0, xsize, ysize);
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderSetImageDownsampling(JxlDecoder* dec,
+                                                uint32_t factor) {
+  if (factor != 1 && factor != jxl::kBlockDim) {
+    return JXL_API_ERROR("Unsupported image downsampling factor");
+  }
+  if (!dec->coalescing) {
+    return JXL_API_ERROR("Image downsampling requires coalescing");
+  }
+  if (dec->image_out_buffer_set) {
+    return JXL_API_ERROR(
+        "Cannot change the image downsampling while an image output is set");
+  }
+  if (factor != 1 && !dec->extra_channel_output.empty()) {
+    return JXL_API_ERROR("Extra channels cannot be output downsampled");
+  }
+  dec->image_downsampling = factor;
   return JXL_DEC_SUCCESS;
 }
 
@@ -1046,13 +1072,27 @@ const jxl::Rect* GetOutputRegion(const JxlDecoder* dec) {
   return &dec->image_region;
 }
 
+// The factor by which the current image is downsampled; it applies to
+// coalesced frames, not to the preview.
+size_t GetOutputDownsampling(const JxlDecoder* dec) {
+  if (!dec->coalescing || dec->frame_header->nonserialized_is_preview) {
+    return 1;
+  }
+  return dec->image_downsampling;
+}
+
 // helper function to get the dimensions of the current image buffer
 void GetCurrentDimensions(const JxlDecoder* dec, size_t& xsize, size_t& ysize) {
   GetFullDimensions(dec, xsize, ysize);
-  if (const jxl::Rect* region = GetOutputRegion(dec)) {
-    xsize = region->xsize();
-    ysize = region->ysize();
-  }
+  const jxl::Rect* region = GetOutputRegion(dec);
+  jxl::Orientation undo_orientation = dec->keep_orientation
+                                          ? jxl::Orientation::kIdentity
+                                          : dec->metadata.m.GetOrientation();
+  jxl::Rect output = jxl::DownsampledOutputRect(
+      region ? *region : jxl::Rect(0, 0, xsize, ysize), undo_orientation, xsize,
+      ysize, GetOutputDownsampling(dec));
+  xsize = output.xsize();
+  ysize = output.ysize();
 }
 }  // namespace
 
@@ -1517,7 +1557,11 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
         }
       }
 
-      if (dec->image_out_buffer_set) {
+      // A downsampled output is written only by the frames that are shown,
+      // the others are decoded as if no output were set.
+      size_t downsampling = GetOutputDownsampling(dec);
+      if (dec->image_out_buffer_set &&
+          (downsampling == 1 || dec->is_last_of_still)) {
         size_t xsize;
         size_t ysize;
         GetFullDimensions(dec, xsize, ysize);
@@ -1530,7 +1574,7 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
             reinterpret_cast<uint8_t*>(dec->image_out_buffer),
             dec->image_out_size, xsize, ysize, dec->image_out_format,
             bits_per_sample, dec->unpremul_alpha, !dec->keep_orientation,
-            GetOutputRegion(dec)));
+            GetOutputRegion(dec), downsampling));
         GetCurrentDimensions(dec, xsize, ysize);
         for (size_t i = 0; i < dec->extra_channel_output.size(); ++i) {
           const auto& extra = dec->extra_channel_output[i];
@@ -1589,6 +1633,10 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
       if (!dec->frame_dec->FinalizeFrame()) {
         return JXL_INPUT_ERROR("decoding frame failed");
       }
+      // Sections that are not needed for a downsampled output may not have
+      // been read.
+      dec->AdvanceCodestream(dec->remaining_frame_size);
+      dec->remaining_frame_size = 0;
 #if JPEGXL_ENABLE_TRANSCODE_JPEG
       // If jpeg output was requested, we merely return the JXL_DEC_FULL_IMAGE
       // status without outputting pixels.
@@ -2677,6 +2725,10 @@ JxlDecoderStatus JxlDecoderExtraChannelBufferSize(const JxlDecoder* dec,
 
   if (index >= dec->metadata.m.num_extra_channels) {
     return JXL_API_ERROR("Invalid extra channel index");
+  }
+
+  if (dec->image_downsampling != 1) {
+    return JXL_API_ERROR("Extra channels cannot be output downsampled");
   }
 
   return GetMinSize(dec, format, 1, size, false);

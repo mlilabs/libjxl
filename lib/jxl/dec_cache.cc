@@ -119,9 +119,15 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
                                            ImageBundle* decoded,
                                            PipelineOptions options) {
   JxlMemoryManager* memory_manager = this->memory_manager();
-  size_t num_c = 3 + frame_header.nonserialized_metadata->m.num_extra_channels;
-  bool render_noise =
-      (options.render_noise && (frame_header.flags & FrameHeader::kNoise) != 0);
+  // With downsampling, the pipeline renders the colour of the DC image, one
+  // pixel per block, without the image features and filters that work at the
+  // resolution of the frame.
+  const bool dc_only = output_downsampling != 1;
+  size_t num_c =
+      dc_only ? 3
+              : 3 + frame_header.nonserialized_metadata->m.num_extra_channels;
+  bool render_noise = (!dc_only && options.render_noise &&
+                       (frame_header.flags & FrameHeader::kNoise) != 0);
   size_t num_tmp_c = render_noise ? 3 : 0;
 
   if (frame_header.CanBeReferenced()) {
@@ -135,92 +141,95 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
     builder.UseSimpleImplementation();
   }
 
-  if (!frame_header.chroma_subsampling.Is444()) {
-    for (size_t c = 0; c < 3; c++) {
-      if (frame_header.chroma_subsampling.HShift(c) != 0) {
+  if (!dc_only) {
+    if (!frame_header.chroma_subsampling.Is444()) {
+      for (size_t c = 0; c < 3; c++) {
+        if (frame_header.chroma_subsampling.HShift(c) != 0) {
+          JXL_RETURN_IF_ERROR(builder.AddStage(
+              GetChromaUpsamplingStage(c, /*horizontal=*/true)));
+        }
+        if (frame_header.chroma_subsampling.VShift(c) != 0) {
+          JXL_RETURN_IF_ERROR(builder.AddStage(
+              GetChromaUpsamplingStage(c, /*horizontal=*/false)));
+        }
+      }
+    }
+
+    if (frame_header.loop_filter.gab) {
+      JXL_RETURN_IF_ERROR(
+          builder.AddStage(GetGaborishStage(frame_header.loop_filter)));
+    }
+
+    {
+      const LoopFilter& lf = frame_header.loop_filter;
+      if (lf.epf_iters >= 3) {
         JXL_RETURN_IF_ERROR(
-            builder.AddStage(GetChromaUpsamplingStage(c, /*horizontal=*/true)));
+            builder.AddStage(GetEPFStage(lf, sigma, EpfStage::Zero)));
       }
-      if (frame_header.chroma_subsampling.VShift(c) != 0) {
-        JXL_RETURN_IF_ERROR(builder.AddStage(
-            GetChromaUpsamplingStage(c, /*horizontal=*/false)));
+      if (lf.epf_iters >= 1) {
+        JXL_RETURN_IF_ERROR(
+            builder.AddStage(GetEPFStage(lf, sigma, EpfStage::One)));
+      }
+      if (lf.epf_iters >= 2) {
+        JXL_RETURN_IF_ERROR(
+            builder.AddStage(GetEPFStage(lf, sigma, EpfStage::Two)));
       }
     }
-  }
 
-  if (frame_header.loop_filter.gab) {
-    JXL_RETURN_IF_ERROR(
-        builder.AddStage(GetGaborishStage(frame_header.loop_filter)));
-  }
+    bool late_ec_upsample = frame_header.upsampling != 1;
+    for (auto ecups : frame_header.extra_channel_upsampling) {
+      if (ecups != frame_header.upsampling) {
+        // If patches are applied, either frame_header.upsampling == 1 or
+        // late_ec_upsample is true.
+        late_ec_upsample = false;
+      }
+    }
 
-  {
-    const LoopFilter& lf = frame_header.loop_filter;
-    if (lf.epf_iters >= 3) {
+    if (!late_ec_upsample) {
+      for (size_t ec = 0; ec < frame_header.extra_channel_upsampling.size();
+           ec++) {
+        if (frame_header.extra_channel_upsampling[ec] != 1) {
+          JXL_RETURN_IF_ERROR(builder.AddStage(GetUpsamplingStage(
+              memory_manager,
+              frame_header.nonserialized_metadata->transform_data, 3 + ec,
+              CeilLog2Nonzero(frame_header.extra_channel_upsampling[ec]))));
+        }
+      }
+    }
+
+    if ((frame_header.flags & FrameHeader::kPatches) != 0) {
+      JXL_RETURN_IF_ERROR(builder.AddStage(GetPatchesStage(
+          &shared->image_features.patches,
+          &frame_header.nonserialized_metadata->m.extra_channel_info)));
+    }
+    if ((frame_header.flags & FrameHeader::kSplines) != 0) {
       JXL_RETURN_IF_ERROR(
-          builder.AddStage(GetEPFStage(lf, sigma, EpfStage::Zero)));
+          builder.AddStage(GetSplineStage(&shared->image_features.splines)));
     }
-    if (lf.epf_iters >= 1) {
-      JXL_RETURN_IF_ERROR(
-          builder.AddStage(GetEPFStage(lf, sigma, EpfStage::One)));
-    }
-    if (lf.epf_iters >= 2) {
-      JXL_RETURN_IF_ERROR(
-          builder.AddStage(GetEPFStage(lf, sigma, EpfStage::Two)));
-    }
-  }
 
-  bool late_ec_upsample = frame_header.upsampling != 1;
-  for (auto ecups : frame_header.extra_channel_upsampling) {
-    if (ecups != frame_header.upsampling) {
-      // If patches are applied, either frame_header.upsampling == 1 or
-      // late_ec_upsample is true.
-      late_ec_upsample = false;
-    }
-  }
-
-  if (!late_ec_upsample) {
-    for (size_t ec = 0; ec < frame_header.extra_channel_upsampling.size();
-         ec++) {
-      if (frame_header.extra_channel_upsampling[ec] != 1) {
+    if (frame_header.upsampling != 1) {
+      size_t nb_channels =
+          3 +
+          (late_ec_upsample ? frame_header.extra_channel_upsampling.size() : 0);
+      for (size_t c = 0; c < nb_channels; c++) {
         JXL_RETURN_IF_ERROR(builder.AddStage(GetUpsamplingStage(
             memory_manager, frame_header.nonserialized_metadata->transform_data,
-            3 + ec,
-            CeilLog2Nonzero(frame_header.extra_channel_upsampling[ec]))));
+            c, CeilLog2Nonzero(frame_header.upsampling))));
       }
     }
-  }
-
-  if ((frame_header.flags & FrameHeader::kPatches) != 0) {
-    JXL_RETURN_IF_ERROR(builder.AddStage(GetPatchesStage(
-        &shared->image_features.patches,
-        &frame_header.nonserialized_metadata->m.extra_channel_info)));
-  }
-  if ((frame_header.flags & FrameHeader::kSplines) != 0) {
-    JXL_RETURN_IF_ERROR(
-        builder.AddStage(GetSplineStage(&shared->image_features.splines)));
-  }
-
-  if (frame_header.upsampling != 1) {
-    size_t nb_channels =
-        3 +
-        (late_ec_upsample ? frame_header.extra_channel_upsampling.size() : 0);
-    for (size_t c = 0; c < nb_channels; c++) {
-      JXL_RETURN_IF_ERROR(builder.AddStage(GetUpsamplingStage(
-          memory_manager, frame_header.nonserialized_metadata->transform_data,
-          c, CeilLog2Nonzero(frame_header.upsampling))));
+    // Starting from this line all the stages considered to have zero xextra.
+    // Upsampling does not have xextra as well (even if it happens before
+    // splines/patches for EC).
+    if (render_noise) {
+      JXL_RETURN_IF_ERROR(builder.AddStage(GetConvolveNoiseStage(num_c)));
+      JXL_RETURN_IF_ERROR(builder.AddStage(GetAddNoiseStage(
+          shared->image_features.noise_params, shared->cmap.base(), num_c)));
     }
-  }
-  // Starting from this line all the stages considered to have zero xextra.
-  // Upsampling does not have xextra as well (even if it happens before
-  // splines/patches for EC).
-  if (render_noise) {
-    JXL_RETURN_IF_ERROR(builder.AddStage(GetConvolveNoiseStage(num_c)));
-    JXL_RETURN_IF_ERROR(builder.AddStage(GetAddNoiseStage(
-        shared->image_features.noise_params, shared->cmap.base(), num_c)));
-  }
-  if (frame_header.dc_level != 0) {
-    JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImage3FStage(
-        memory_manager, &shared_storage.dc_frames[frame_header.dc_level - 1])));
+    if (frame_header.dc_level != 0) {
+      JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImage3FStage(
+          memory_manager,
+          &shared_storage.dc_frames[frame_header.dc_level - 1])));
+    }
   }
 
   if (frame_header.CanBeReferenced() &&
@@ -231,7 +240,7 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
 
   bool has_alpha = false;
   size_t alpha_c = 0;
-  for (size_t i = 0; i < metadata->extra_channel_info.size(); i++) {
+  for (size_t i = 0; !dc_only && i < metadata->extra_channel_info.size(); i++) {
     if (metadata->extra_channel_info[i].type == ExtraChannel::kAlpha) {
       has_alpha = true;
       alpha_c = 3 + i;
@@ -285,7 +294,7 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
           &frame_storage_for_referencing, &metadata->color_encoding)));
     }
 
-    if (options.render_spotcolors &&
+    if (!dc_only && options.render_spotcolors &&
         frame_header.nonserialized_metadata->m.Find(ExtraChannel::kSpotColor)) {
       for (size_t i = 0; i < metadata->extra_channel_info.size(); i++) {
         // Don't use Find() because there may be multiple spot color channels.
@@ -365,8 +374,15 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
           decoded, &output_encoding_info.color_encoding)));
     }
   }
-  JXL_ASSIGN_OR_RETURN(render_pipeline,
-                       std::move(builder).Finalize(shared->frame_dim));
+  FrameDimensions frame_dim = shared->frame_dim;
+  if (dc_only) {
+    // One group of the DC image per DC group of the frame.
+    frame_dim.Set(shared->frame_dim.xsize_blocks,
+                  shared->frame_dim.ysize_blocks, frame_header.group_size_shift,
+                  /*max_hshift=*/0, /*max_vshift=*/0, /*modular_mode=*/true,
+                  /*upsampling=*/1);
+  }
+  JXL_ASSIGN_OR_RETURN(render_pipeline, std::move(builder).Finalize(frame_dim));
   return render_pipeline->IsInitialized();
 }
 
